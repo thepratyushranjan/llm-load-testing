@@ -16,6 +16,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     print(f"🚀 Starting {settings.app_name} v{settings.app_version}")
     db.connect()
+    db.init_schema()
     yield
     # Shutdown: Disconnect from ClickHouse
     db.disconnect()

@@ -60,6 +60,14 @@ class ClickHouseDatabase:
             return False
         return False
     
+    def init_schema(self) -> None:
+        """Create load-test tables and views if they don't exist"""
+        from src.models.tables import SCHEMA_STATEMENTS
+
+        for statement in SCHEMA_STATEMENTS:
+            self.execute_command(statement)
+        print(f"✅ Load-test schema ready ({len(SCHEMA_STATEMENTS)} objects)")
+
     def get_version(self) -> Optional[str]:
         """Get ClickHouse server version"""
         try:

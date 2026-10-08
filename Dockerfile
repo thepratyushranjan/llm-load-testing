@@ -5,6 +5,11 @@ WORKDIR /app
 # Set Python path
 ENV PYTHONPATH=/app
 
+# ffmpeg/ffprobe for the video dataset pipeline
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy requirements first for better caching
 COPY requirements.txt .
 

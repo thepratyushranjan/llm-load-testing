@@ -35,8 +35,160 @@ services:
     networks:
       - app-network
 
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource 4.4.0
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  scheduler:
+    build: .
+    container_name: llm-load-testing-scheduler
+    command: ["python", "-m", "src.services.scheduler"]
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.core.healthcheck", "scheduler"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  worker:
+    build: .
+    command: ["python", "-m", "src.services.worker"]
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.core.healthcheck", "worker"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  ch-writer:
+    build: .
+    container_name: llm-load-testing-ch-writer
+    command: ["python", "-m", "src.services.ch_writer"]
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.core.healthcheck", "ch-writer"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  metrics-poller:
+    build: .
+    container_name: llm-load-testing-metrics-poller
+    # Only ONE machine scrapes vLLM: docker compose --profile metrics up -d
+    profiles: ["metrics"]
+    command: ["python", "-m", "src.services.metrics_poller"]
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.core.healthcheck", "metrics-poller"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  dataset:
+    build: .
+    # Dataset tools, run on demand, e.g.:
+    #   docker compose run --rm dataset python -m src.services.manifest
+    #   docker compose run --rm dataset python -m src.services.preencode
+    profiles: ["tools"]
+    command: ["python", "-m", "src.services.manifest", "--help"]
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - app-network
+
 volumes:
   clickhouse_data:
+  redis_data:
+  grafana_data:
 
 networks:
   app-network:
