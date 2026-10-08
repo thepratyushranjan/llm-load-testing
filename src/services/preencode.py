@@ -48,6 +48,22 @@ def cache_path(data_dir: Path, kind: str, variant: str, sha1: str) -> Path:
     return data_dir / "cache" / kind / variant / f"{sha1}.{ext}"
 
 
+def frame_paths(data_dir: Path, variant: str, sha1: str, n: int) -> List[Path]:
+    """Frames used when VIDEO_INPUT=frames (models without video input, e.g. Ollama)"""
+    return [data_dir / "cache" / "frames" / variant / sha1 / f"f{i:02d}.jpg" for i in range(1, n + 1)]
+
+
+def extract_frames(video: str, dsts: List[Path], duration_s: float) -> None:
+    """N evenly spaced frames from a cached video variant"""
+    dsts[0].parent.mkdir(parents=True, exist_ok=True)
+    for k, dst in enumerate(dsts):
+        at = duration_s * (k + 0.5) / len(dsts)
+        tmp = dst.with_suffix(".tmp.jpg")
+        subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-ss", f"{at:.3f}", "-i", video,
+                        "-frames:v", "1", "-q:v", "3", str(tmp)], check=True, capture_output=True, timeout=120)
+        os.replace(tmp, dst)
+
+
 def encode_image(src: str, dst: str, max_pixels: int, quality: int) -> Tuple[int, int]:
     with Image.open(src) as im:
         im = ImageOps.exif_transpose(im).convert("RGB")
@@ -172,6 +188,24 @@ def main() -> int:
                 failed.append(f"{src} [{variant}]: {e}")
             if done % 20 == 0 or done == len(futures):
                 print(f"   videos {done}/{len(futures)}")
+
+    if settings.video_input == "frames":
+        variant = video_variant(settings.video_side)
+        jobs = []
+        for sha1 in videos:
+            entry = index.get((sha1, variant))
+            dsts = frame_paths(data_dir, variant, sha1, settings.video_frames)
+            if entry and (args.force or not all(d.exists() for d in dsts)):
+                jobs.append((sha1, entry, dsts))
+        with ThreadPoolExecutor(max_workers=max(1, args.workers // 2)) as pool:
+            futures = {pool.submit(extract_frames, str(data_dir / e.path), d, e.duration_s or 1.0): sha1
+                       for sha1, e, d in jobs}
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as e:
+                    failed.append(f"frames {futures[fut]}: {e}")
+        print(f"   frames: {len(jobs)} videos × {settings.video_frames} frames extracted ({variant})")
 
     index_path.parent.mkdir(parents=True, exist_ok=True)
     write_cache_index(index, index_path)

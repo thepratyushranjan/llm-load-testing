@@ -45,6 +45,21 @@ class Settings(BaseSettings):
 
     # Request Settings
     guided_json: bool = False       # constrain output to the response schema
+    extra_body: str = ""            # JSON merged into every request, e.g. {"reasoning_effort": "none"}
+    video_input: str = "video"      # video: video_url part (vLLM) | frames: N image parts (models without video, e.g. Ollama)
+    video_frames: int = 4           # frames per video when video_input=frames
+    video_side: int = 1280          # which video variant (VIDEO_VARIANTS_SIDE) requests use; images use MAX_PIXELS
+
+    # Mock vLLM Settings (src/services/mock_vllm.py)
+    mock_max_num_seqs: int = 16             # concurrent sequences; the rest wait, like a real GPU
+    mock_prefill_tokens_per_s: float = 8000
+    mock_decode_tokens_per_s: float = 40    # per sequence
+    mock_image_tokens: int = 1000
+    mock_video_tokens: int = 4000
+    mock_error_rate: float = 0.0            # HTTP 500
+    mock_rate_limit_rate: float = 0.0       # HTTP 429 with Retry-After
+    mock_hang_rate: float = 0.0             # never answers (client timeout)
+    mock_invalid_json_rate: float = 0.0     # truncated JSON
 
     # Worker Settings
     worker_concurrency: int = 64

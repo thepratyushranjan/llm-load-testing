@@ -69,7 +69,7 @@ def main() -> int:
     rows = load_manifest()
     truth, stats = load_ground_truth(rows, args.path)
     if not stats["label_rows"]:
-        print("ℹ️  No ground-truth file; the Gemini baseline will provide reference answers")
+        print("ℹ️  No ground-truth file; accuracy is not measured, only JSON / schema validity")
         return 0
 
     trained = [r for r in rows if r.split == "trained"]

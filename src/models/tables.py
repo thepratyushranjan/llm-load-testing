@@ -4,7 +4,6 @@ CREATE TABLE IF NOT EXISTS lt_runs
     run_id              String,
     machine_id          LowCardinality(String),
     profile             LowCardinality(String),
-    provider            LowCardinality(String),
     model               LowCardinality(String),
     vllm_config         String,                  -- JSON: launch flags, version
     worker_concurrency  UInt32,
@@ -30,7 +29,6 @@ CREATE TABLE IF NOT EXISTS lt_requests
     step                UInt16,
     job_id              String,
     attempt             UInt8,
-    provider            LowCardinality(String),  -- vllm | gemini
     model               LowCardinality(String),
     function            LowCardinality(String),  -- event | ai_info | extraction
     case_id             String,
@@ -68,7 +66,7 @@ CREATE TABLE IF NOT EXISTS lt_requests
 )
 ENGINE = ReplacingMergeTree(inserted_ts)
 PARTITION BY toDate(created_ts)
-ORDER BY (run_id, function, provider, created_ts, job_id, attempt)
+ORDER BY (run_id, function, created_ts, job_id, attempt)
 SETTINGS non_replicated_deduplication_window = 1000
 """
 
@@ -79,7 +77,6 @@ CREATE TABLE IF NOT EXISTS lt_responses
     machine_id          LowCardinality(String),
     job_id              String,
     attempt             UInt8,
-    provider            LowCardinality(String),
     model               LowCardinality(String),
     function            LowCardinality(String),
     case_id             String,
@@ -94,7 +91,7 @@ CREATE TABLE IF NOT EXISTS lt_responses
     inserted_ts         DateTime64(3, 'UTC') DEFAULT now64(3)
 )
 ENGINE = ReplacingMergeTree(inserted_ts)
-ORDER BY (provider, function, case_id, run_id, job_id, attempt)
+ORDER BY (function, case_id, run_id, job_id, attempt)
 SETTINGS non_replicated_deduplication_window = 1000
 """
 
@@ -128,7 +125,6 @@ CREATE TABLE IF NOT EXISTS lt_requests_1m
     machine_id      LowCardinality(String),
     step            UInt16,
     function        LowCardinality(String),
-    provider        LowCardinality(String),
     requests        SimpleAggregateFunction(sum, UInt64),
     ok              SimpleAggregateFunction(sum, UInt64),
     errors          SimpleAggregateFunction(sum, UInt64),
@@ -144,7 +140,7 @@ CREATE TABLE IF NOT EXISTS lt_requests_1m
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toDate(minute)
-ORDER BY (run_id, function, provider, machine_id, step, minute)
+ORDER BY (run_id, function, machine_id, step, minute)
 -- Lets a retried writer batch (same insert_deduplication_token) be dropped here too;
 -- the writer must insert with deduplicate_blocks_in_dependent_materialized_views=1.
 SETTINGS non_replicated_deduplication_window = 1000
@@ -154,7 +150,7 @@ LT_REQUESTS_1M_MV = """
 CREATE MATERIALIZED VIEW IF NOT EXISTS lt_requests_1m_mv TO lt_requests_1m AS
 SELECT
     toStartOfMinute(created_ts) AS minute,
-    run_id, machine_id, step, function, provider,
+    run_id, machine_id, step, function,
     count() AS requests,
     countIf(status = 'ok') AS ok,
     countIf(status = 'error') AS errors,
@@ -168,45 +164,7 @@ SELECT
     quantilesStateIf(0.5, 0.95, 0.99)(toFloat64(assumeNotNull(model_latency_ms)), status = 'ok' AND model_latency_ms IS NOT NULL) AS model_q,
     quantilesStateIf(0.5, 0.95, 0.99)(toFloat64(assumeNotNull(ttft_ms)), status = 'ok' AND ttft_ms IS NOT NULL) AS ttft_q
 FROM lt_requests
-GROUP BY minute, run_id, machine_id, step, function, provider
-"""
-
-# vLLM vs Gemini agreement per case (image+video) and function, split by trained / untrained.
-# Gemini is run once per case, so its rows are matched by case_id regardless of run_id.
-LT_QUALITY = """
-CREATE VIEW IF NOT EXISTS lt_quality AS
-SELECT
-    v.run_id AS run_id,
-    v.function AS function,
-    v.split AS split,
-    count() AS compared,
-    countIf(v.alert_valid = g.alert_valid)
-        / nullIf(countIf(v.alert_valid IS NOT NULL AND g.alert_valid IS NOT NULL), 0) AS alert_agreement,
-    countIf(upper(replaceAll(v.plate_number, ' ', '')) = upper(replaceAll(g.plate_number, ' ', '')))
-        / nullIf(countIf(v.plate_number IS NOT NULL AND g.plate_number IS NOT NULL), 0) AS plate_agreement,
-    avg(length(arrayIntersect(v.labels, g.labels))
-        / greatest(length(arrayDistinct(arrayConcat(v.labels, g.labels))), 1)) AS label_jaccard,
-    countIf(v.severity = g.severity)
-        / nullIf(countIf(v.severity IS NOT NULL AND g.severity IS NOT NULL), 0) AS severity_agreement
-FROM
-(
-    SELECT run_id, function, split, case_id, alert_valid, plate_number, labels, severity
-    FROM lt_responses FINAL
-    WHERE provider = 'vllm'
-) AS v
-INNER JOIN
-(
-    SELECT
-        function, case_id,
-        argMax(alert_valid, inserted_ts) AS alert_valid,
-        argMax(plate_number, inserted_ts) AS plate_number,
-        argMax(labels, inserted_ts) AS labels,
-        argMax(severity, inserted_ts) AS severity
-    FROM lt_responses
-    WHERE provider = 'gemini'
-    GROUP BY function, case_id
-) AS g ON v.function = g.function AND v.case_id = g.case_id
-GROUP BY run_id, function, split
+GROUP BY minute, run_id, machine_id, step, function
 """
 
 SCHEMA_STATEMENTS = [
@@ -216,5 +174,4 @@ SCHEMA_STATEMENTS = [
     LT_SERVER_METRICS,
     LT_REQUESTS_1M,
     LT_REQUESTS_1M_MV,
-    LT_QUALITY,
 ]

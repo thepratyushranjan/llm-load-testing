@@ -6,7 +6,6 @@ from typing import Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 Function = Literal["event", "ai_info", "extraction"]
-Provider = Literal["vllm", "gemini"]
 Split = Literal["trained", "untrained"]
 
 
@@ -41,7 +40,6 @@ class Job(BaseModel):
     machine_id: str
     step: int = 0
     attempt: int = 0
-    provider: Provider = "vllm"
     function: Function
     split: Optional[Split] = None
     case_id: str  # manifest id of the image/video case
@@ -68,7 +66,6 @@ class Result(BaseModel):
     step: int
     job_id: str
     attempt: int
-    provider: Provider
     model: str
     function: Function
     case_id: str

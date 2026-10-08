@@ -132,7 +132,7 @@ class BaseTask:
         return result
 
     def key_fields(self, response: Dict) -> Dict[str, Any]:
-        """Fields compared against Gemini / ground truth: alert_valid, plate_number, labels, severity"""
+        """Fields compared against ground truth: alert_valid, plate_number, labels, severity"""
         raise NotImplementedError
 
 
