@@ -19,10 +19,12 @@ def _bool(value: str) -> Optional[bool]:
 
 
 def _case_lookup(rows: List[ManifestRow]) -> Dict[str, List[ManifestRow]]:
-    """Ground-truth ids may be a case_id or an image/video file name (with or without extension)"""
+    """Ground-truth ids may be a case_id, an event folder name or an image/video file name (with or without extension)"""
     lookup: Dict[str, List[ManifestRow]] = {}
     for r in rows:
         keys = {r.case_id}
+        if r.payload_path:
+            keys.add(Path(r.payload_path).parent.name)
         for media in (r.image_path, r.video_path):
             if media:
                 keys |= {Path(media).name, Path(media).stem}
@@ -32,14 +34,14 @@ def _case_lookup(rows: List[ManifestRow]) -> Dict[str, List[ManifestRow]]:
 
 
 def load_ground_truth(rows: List[ManifestRow], path: Optional[str] = None) -> Tuple[Dict[Tuple[str, str], GroundTruth], Counter]:
-    """(case_id, function) -> labels, joined to the manifest by image_id"""
+    """(case_id, function) -> labels from ground_truth.csv, joined by image_id"""
     path = Path(path or get_settings().ground_truth_path)
     stats = Counter()
+    truth: Dict[Tuple[str, str], GroundTruth] = {}
     if not path.exists():
-        return {}, stats
+        return truth, stats
 
     lookup = _case_lookup(rows)
-    truth: Dict[Tuple[str, str], GroundTruth] = {}
     with path.open(newline="") as f:
         for rec in csv.DictReader(f):
             stats["label_rows"] += 1

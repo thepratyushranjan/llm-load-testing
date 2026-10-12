@@ -38,6 +38,25 @@ class ClickHouseDatabase:
             self.client = None
             print("✅ Disconnected from ClickHouse")
     
+    def insert(self, table: str, rows: list, column_names: list, settings: Optional[dict] = None):
+        """Insert rows (list of lists) into a table"""
+        if not self.client:
+            raise ConnectionError("Not connected to ClickHouse")
+        return self.client.insert(table, rows, column_names=column_names, settings=settings or {})
+
+    def query_rows(self, query: str, parameters: Optional[dict] = None) -> list:
+        """Run a parameterised SELECT and return its rows as dicts"""
+        if not self.client:
+            raise ConnectionError("Not connected to ClickHouse")
+        result = self.client.query(query, parameters=parameters or {})
+        return [dict(zip(result.column_names, row)) for row in result.result_rows]
+
+    def export_parquet(self, query: str, parameters: Optional[dict] = None) -> bytes:
+        """Run a SELECT and return the result as a Parquet file"""
+        if not self.client:
+            raise ConnectionError("Not connected to ClickHouse")
+        return self.client.raw_query(query, parameters=parameters or {}, fmt="Parquet")
+
     def execute_query(self, query: str):
         """Execute a query and return results"""
         if not self.client:

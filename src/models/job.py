@@ -51,6 +51,9 @@ class Job(BaseModel):
     def expired(self, at_ms: Optional[int] = None) -> bool:
         return (at_ms or now_ms()) >= self.deadline_ts
 
+    def next_attempt(self) -> "Job":
+        return self.model_copy(update={"attempt": self.attempt + 1})
+
     def to_stream(self) -> Dict[str, str]:
         return {"job": self.model_dump_json()}
 
@@ -73,6 +76,8 @@ class Result(BaseModel):
     n_images: int = 0
     n_videos: int = 0
     media_bytes: int = 0
+    video_duration_s: Optional[float] = None
+    num_frames: Optional[int] = None  # VIDEO_INPUT=frames
 
     created_ts: int
     enqueued_ts: Optional[int] = None
@@ -93,6 +98,8 @@ class Result(BaseModel):
 
     raw_text: Optional[str] = None
     parsed_json: Optional[Dict] = None
+    prompt_version: Optional[str] = None
+    key_fields: Optional[Dict] = None  # alert_valid, plate_number, labels, severity
 
     def to_stream(self) -> Dict[str, str]:
         return {"result": self.model_dump_json()}

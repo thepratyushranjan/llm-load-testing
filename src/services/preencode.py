@@ -134,7 +134,7 @@ def main() -> int:
     args = parser.parse_args()
 
     rows = load_manifest(machine=None if args.all else args.machine)
-    images = {r.image_sha1: data_dir / r.image_path for r in rows if r.image_sha1}
+    images = {sha1: data_dir / path for r in rows for path, sha1 in r.images}
     videos = {r.video_sha1: data_dir / r.video_path for r in rows if r.video_sha1}
     print(f"🧮 {len(rows)} cases → {len(images)} images × {len(settings.image_variants)} variants, "
           f"{len(videos)} videos × {len(settings.video_variants)} variants")

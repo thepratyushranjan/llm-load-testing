@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Load-test control for this machine, e.g.:
+#   ./lt profiles | ./lt run --profile smoke --follow | ./lt status --watch | ./lt pause | ./lt resume | ./lt stop | ./lt export
+TTY=""; [ -t 0 ] && [ -t 1 ] || TTY="-T"
+exec docker compose run --rm $TTY dataset python -m src.services.cli "$@"

@@ -33,8 +33,8 @@ class JobBuilder:
             else:
                 refs.append(MediaRef(kind="video", sha1=entry.sha1, path=entry.path, bytes=entry.bytes,
                                      duration_s=entry.duration_s))
-        if row.image_sha1:
-            entry = self._entry(row.image_sha1, self.image_variant)
+        for _, sha1 in row.images:
+            entry = self._entry(sha1, self.image_variant)
             refs.append(MediaRef(kind="image", sha1=entry.sha1, path=entry.path, bytes=entry.bytes))
         return refs
 
@@ -56,7 +56,7 @@ class JobBuilder:
             split=row.split if row.split in ("trained", "untrained") else None,
             case_id=row.case_id,
             media=self.media(row, function),
-            event_meta=self.meta_loader.get(row).model_dump(include={"meta", "data"}) if function in EVENT_FUNCTIONS else None,
+            event_meta=self.meta_loader.get(row, function).model_dump(include={"meta", "data"}) if function in EVENT_FUNCTIONS else None,
             created_ts=created,
             deadline_ts=created + int(deadline_s * 1000),
         )

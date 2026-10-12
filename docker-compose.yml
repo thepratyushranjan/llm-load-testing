@@ -79,6 +79,9 @@ services:
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_PORT=8123
       - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data:/app/data:ro
+      - ${DATASET_DIR:-./data}:/app/dataset:ro   # your image folder, read-only, never copied
     depends_on:
       redis:
         condition: service_healthy
@@ -150,8 +153,8 @@ services:
   metrics-poller:
     build: .
     container_name: llm-load-testing-metrics-poller
-    # Only ONE machine scrapes vLLM: docker compose --profile metrics up -d
-    profiles: ["metrics"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command: ["python", "-m", "src.services.metrics_poller"]
     env_file: .env
     environment:
@@ -186,6 +189,7 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
+      - ${DATASET_DIR:-./data}:/app/dataset:ro   # your image folder, read-only, never copied
     networks:
       - app-network
 

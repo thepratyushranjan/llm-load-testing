@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 from typing import List
@@ -64,7 +65,19 @@ class Settings(BaseSettings):
     # Worker Settings
     worker_concurrency: int = 64
     request_timeout_s: float = 30.0
-    max_retries: int = 2
+    max_retries: int = 2               # model-call retries (429 / 5xx / timeout) before the DLQ
+    max_deliveries: int = 3            # times a job may be handed out after worker crashes before the DLQ
+    claim_idle_s: float = 0            # reclaim jobs unacked this long (0 = 2 x request_timeout_s)
+    retry_backoff_s: float = 1.0       # first retry delay when no Retry-After; doubles per attempt
+    max_rps: float = 0                 # token-bucket cap on requests sent from this machine (0 = no cap)
+    rate_burst: int = 0                # bucket size (0 = max(1, max_rps))
+    idempotency_ttl_s: int = 86400
+
+    # Auto-stop (a run can override these)
+    auto_stop: bool = True
+    sla_p95_ms: float = 0              # stop when p95 end-to-end latency exceeds this (0 = off until the SLA is agreed)
+    max_error_rate: float = 0.02       # stop when more than this share of the last minute's requests fail
+    queue_growth_window_s: float = 120 # stop when the queue keeps growing for this long
 
     # Writer / Poller Settings
     ch_flush_interval_s: float = 2.0
@@ -81,7 +94,7 @@ class Settings(BaseSettings):
     video_max_seconds: float = 10.0            # trim clips to this length (0 = keep)
     video_fps: float = 0.0                     # re-time clips to this fps (0 = keep)
     jpeg_quality: int = 90
-    zone_type: str = "office"                  # synthetic event vertical
+    dataset_mount: str = "/app/dataset"        # where DATASET_DIR (your image folder) is mounted in the containers
 
     @property
     def machine_list(self) -> List[str]:
@@ -115,6 +128,14 @@ class Settings(BaseSettings):
         env_file = ".env"
         case_sensitive = False
         extra = "ignore"
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _drop_inline_comment(cls, value):
+        """docker compose passes `KEY=   # comment` through as the value "# comment" """
+        if isinstance(value, str) and value.strip().startswith("#"):
+            return ""
+        return value
 
     @property
     def function_list(self) -> List[str]:
