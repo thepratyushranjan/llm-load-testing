@@ -14,6 +14,7 @@ from src.core import keys
 from src.core.config import Settings, get_settings
 from src.models.job import Job, Result, now_ms
 from src.redis_client import connect_redis, ensure_group
+from src.services import run_stats
 
 # Token bucket shared by every worker on this machine. Returns 0 if a token was taken,
 # otherwise the ms to wait before trying again. Uses Redis time so all callers agree.
@@ -41,6 +42,8 @@ return wait
 PUBLISH_ONCE = """
 if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
   redis.call('XADD', KEYS[2], '*', 'result', ARGV[1])
+  redis.call('RPUSH', KEYS[3], ARGV[3])
+  redis.call('EXPIRE', KEYS[3], ARGV[4])
   return 1
 end
 return 0
@@ -200,10 +203,12 @@ class JobQueue:
         return bool(await self.redis.exists(keys.idempotency_key(job.job_id, job.attempt)))
 
     async def publish_result(self, result: Result) -> bool:
-        """Publish once per job_id:attempt. False if this attempt was already recorded"""
+        """Publish once per job_id:attempt (+ its live-stats entry). False if this attempt was already recorded"""
         added = await self._publish_once(
-            keys=[keys.idempotency_key(result.job_id, result.attempt), keys.RESULTS_STREAM],
-            args=[result.model_dump_json(), self.settings.idempotency_ttl_s])
+            keys=[keys.idempotency_key(result.job_id, result.attempt), keys.RESULTS_STREAM,
+                  keys.run_stats_key(result.run_id)],
+            args=[result.model_dump_json(), self.settings.idempotency_ttl_s, run_stats.entry(result),
+                  run_stats.STATS_TTL_S])
         return bool(added)
 
     async def read_results(self, consumer: str, count: int, block_ms: int = 1000,

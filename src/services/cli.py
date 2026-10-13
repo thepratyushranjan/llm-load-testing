@@ -4,49 +4,20 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 from src.core import keys
 from src.core.config import get_settings
 from src.core.profiles import PROFILES, RunSpec, load_profile
 from src.database import db
 from src.redis_client import connect_redis
+from src.services import run_stats
 from src.services.job_queue import ControlState, JobQueue
 
 EXPORT_TABLES = {
-    "lt_runs": "SELECT * FROM lt_runs FINAL WHERE run_id = {run:String}",
-    "lt_requests": "SELECT * EXCEPT (inserted_ts), inserted_ts, queue_wait_ms, ttft_ms, model_latency_ms, "
-                   "e2e_ms, writer_lag_ms FROM lt_requests FINAL WHERE run_id = {run:String} ORDER BY created_ts",
-    "lt_responses": "SELECT * FROM lt_responses FINAL WHERE run_id = {run:String}",
-    "lt_server_metrics": "SELECT * FROM lt_server_metrics WHERE run_id = {run:String} ORDER BY ts",
+    "event_responses": "SELECT * FROM event_responses FINAL WHERE run_id = {run:String}",
+    "ai_info_responses": "SELECT * FROM ai_info_responses FINAL WHERE run_id = {run:String}",
+    "image_analysis_responses": "SELECT * FROM image_analysis_responses FINAL WHERE run_id = {run:String}",
 }
-
-LAST_MINUTE_SQL = """
-SELECT count() AS rows,
-       countIf(sent_ts IS NOT NULL) / 60 AS rps,
-       countIf(status = 'ok') AS ok,
-       countIf(status IN ('error', 'timeout', 'rate_limited', 'expired', 'dlq')) AS failed,
-       round(quantileIf(0.5)(e2e_ms, status = 'ok')) AS p50_e2e_ms,
-       round(quantileIf(0.95)(e2e_ms, status = 'ok')) AS p95_e2e_ms,
-       round(quantileIf(0.95)(ttft_ms, status = 'ok')) AS p95_ttft_ms,
-       round(avgIf(json_parse_ok, status = 'ok') * 100, 1) AS json_ok_pct,
-       round(avgIf(schema_valid, status = 'ok') * 100, 1) AS schema_ok_pct
-FROM lt_requests
-WHERE run_id = {run:String} AND created_ts >= now64(3) - INTERVAL 60 SECOND
-"""
-
-RUN_SUMMARY_SQL = """
-SELECT step, function, count() AS rows,
-       countIf(status = 'ok') AS ok,
-       countIf(status != 'ok') AS not_ok,
-       round(quantileIf(0.5)(e2e_ms, status = 'ok')) AS p50_ms,
-       round(quantileIf(0.95)(e2e_ms, status = 'ok')) AS p95_ms,
-       round(quantileIf(0.95)(ttft_ms, status = 'ok')) AS p95_ttft_ms,
-       round(avgIf(schema_valid, status = 'ok') * 100, 1) AS schema_ok_pct
-FROM lt_requests FINAL
-WHERE run_id = {run:String}
-GROUP BY step, function ORDER BY step, function
-"""
 
 
 def table(rows: list) -> str:
@@ -170,13 +141,16 @@ class Cli:
         for w in workers:
             print(f"worker: cpu {w.get('cpu_pct')}%  inflight {w.get('inflight')}  done {w.get('done')}  "
                   f"loop lag {w.get('loop_lag_ms')}ms")
+        server = await self.redis.hgetall(keys.SERVER_METRICS_KEY)
+        if server and time.time() * 1000 - int(server.get("ts_ms", 0)) <= 30_000:
+            print("vLLM: " + "  ".join(f"{k} {v or '-'}" for k, v in server.items() if k not in ("ts_ms", "run_id")))
         if run_id:
-            ch = self.ch()
-            [last] = await asyncio.to_thread(ch.query_rows, LAST_MINUTE_SQL, {"run": run_id})
-            print(f"last 60s: {last}")
-            if not getattr(args, "brief", False):
+            brief = getattr(args, "brief", False)
+            entries = await run_stats.load(self.redis, run_id, last=5000 if brief else 0)
+            print(f"last 60s: {run_stats.last_minute(entries, int(time.time() * 1000))}")
+            if not brief:
                 print("by step / function:")
-                print(table(await asyncio.to_thread(ch.query_rows, RUN_SUMMARY_SQL, {"run": run_id})))
+                print(table(run_stats.by_step_function(entries)))
         return 0
 
     async def export(self, args) -> int:
@@ -191,7 +165,12 @@ class Cli:
             data = await asyncio.to_thread(ch.export_parquet, sql, {"run": run_id})
             (out / f"{name}.parquet").write_bytes(data)
             [n] = await asyncio.to_thread(ch.query_rows, f"SELECT count() AS n FROM ({sql})", {"run": run_id})
-            print(f"  {name:18} {n['n']:>7} rows → {out / (name + '.parquet')}")
+            print(f"  {name:25} {n['n']:>7} rows → {out / (name + '.parquet')}")
+        entries = await run_stats.load(self.redis, run_id)
+        summary = {"run": await self.redis.hgetall(keys.run_info_key(run_id)),
+                   "overall": run_stats.summarize(entries), "by_step_function": run_stats.by_step_function(entries)}
+        (out / "summary.json").write_text(json.dumps(summary, indent=2))
+        print(f"  {'summary.json':25} {len(entries):>7} requests (speed, errors) → {out / 'summary.json'}")
         print(f"✅ exported {run_id}")
         return 0
 

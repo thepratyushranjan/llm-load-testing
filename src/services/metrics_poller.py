@@ -1,8 +1,6 @@
-import asyncio
 import re
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
 from typing import Dict, Optional
 
 import httpx
@@ -12,9 +10,6 @@ from src.core.profiles import RunSpec
 from src.services.base import BaseService
 
 LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([-+0-9.eE]+|NaN|[+-]Inf)')
-COLUMNS = ["ts", "run_id", "machine_id", "requests_running", "requests_waiting", "kv_cache_usage",
-           "prefix_cache_hit_rate", "prompt_tokens_per_s", "generation_tokens_per_s",
-           "gpu_util", "gpu_mem_used_bytes", "cpu_util"]
 WARN_EVERY_S = 60
 
 
@@ -33,10 +28,9 @@ def first(metrics: Dict[str, float], *names: str) -> Optional[float]:
 
 
 class MetricsPoller(BaseService):
-    """Scrapes vLLM /metrics into lt_server_metrics, next to the client-side request metrics"""
+    """Scrapes vLLM /metrics into Redis (latest sample) for auto-stop and ./lt status"""
 
     name = "metrics-poller"
-    uses_clickhouse = True
 
     async def setup(self) -> None:
         await super().setup()
@@ -88,12 +82,18 @@ class MetricsPoller(BaseService):
         self.prev, self.prev_t = m, now
 
         raw = await self.redis.get(keys.CURRENT_RUN_KEY)
-        run_id = RunSpec.model_validate_json(raw).run_id if raw else ""
-        row = [datetime.now(timezone.utc), run_id, self.settings.machine_id,
-               m.get("vllm:num_requests_running", 0.0), m.get("vllm:num_requests_waiting", 0.0),
-               first(m, "vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc") or 0.0,
-               rates["hit_rate"], rates["prompt"], rates["generation"], None, None, None]
-        await asyncio.to_thread(self.db.insert, "lt_server_metrics", [row], COLUMNS)
+        sample = {
+            "ts_ms": int(time.time() * 1000),
+            "run_id": RunSpec.model_validate_json(raw).run_id if raw else "",
+            "requests_running": m.get("vllm:num_requests_running", 0.0),
+            "requests_waiting": m.get("vllm:num_requests_waiting", 0.0),
+            "kv_cache_usage": first(m, "vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc") or 0.0,
+            "prefix_cache_hit_rate": rates["hit_rate"],
+            "prompt_tokens_per_s": rates["prompt"],
+            "generation_tokens_per_s": rates["generation"],
+        }
+        await self.redis.hset(keys.SERVER_METRICS_KEY, mapping={
+            k: "" if v is None else str(round(v, 4) if isinstance(v, float) else v) for k, v in sample.items()})
 
 
 if __name__ == "__main__":

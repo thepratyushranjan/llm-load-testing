@@ -21,6 +21,7 @@ services:
 
   api:
     build: .
+    image: llm-load-testing:latest   # one image for every service (built once)
     container_name: llm-load-testing-api
     ports:
       - "8000:8000"
@@ -71,6 +72,7 @@ services:
 
   scheduler:
     build: .
+    image: llm-load-testing:latest   # one image for every service (built once)
     container_name: llm-load-testing-scheduler
     command: ["python", "-m", "src.services.scheduler"]
     env_file: .env
@@ -99,6 +101,7 @@ services:
 
   worker:
     build: .
+    image: llm-load-testing:latest   # one image for every service (built once)
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command: ["python", "-m", "src.services.worker"]
@@ -127,6 +130,7 @@ services:
 
   ch-writer:
     build: .
+    image: llm-load-testing:latest   # one image for every service (built once)
     container_name: llm-load-testing-ch-writer
     command: ["python", "-m", "src.services.ch_writer"]
     env_file: .env
@@ -152,6 +156,7 @@ services:
 
   metrics-poller:
     build: .
+    image: llm-load-testing:latest   # one image for every service (built once)
     container_name: llm-load-testing-metrics-poller
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -179,6 +184,7 @@ services:
 
   dataset:
     build: .
+    image: llm-load-testing:latest   # one image for every service (built once)
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # Dataset tools, run on demand, e.g.:
@@ -195,6 +201,7 @@ services:
 
   mock-vllm:
     build: .
+    image: llm-load-testing:latest   # one image for every service (built once)
     container_name: mock-vllm
     # Stand-in for vLLM (no GPU): docker compose --profile mock up -d
     profiles: ["mock"]

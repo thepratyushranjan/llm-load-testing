@@ -103,10 +103,27 @@ class EventTask(BaseTask):
             "event_roi": [],
         }
 
-    def key_fields(self, response: Dict) -> Dict[str, Any]:
+    def record(self, response: Dict) -> Dict[str, Any]:
+        valid = response["alert_status"] == "True"
+        if valid:
+            details, analysis = response["alert_details"], {}
+            claimed, cam = details, details.get("cam_name")
+            ai_people = response.get("ai_verified_people_count")
+        else:
+            claimed, analysis = response["claimed_data"], response["ai_analysis"]
+            cam = response["event_reference"].get("cam_name")
+            ai_people = analysis.get("actual_people_count")
         return {
-            "alert_valid": response["alert_status"] == "True",
-            "plate_number": None,
-            "labels": sorted({roi["label"] for roi in response["event_roi"]}),
-            "severity": None,
+            "alert_valid": int(valid),
+            "verdict": analysis.get("verdict") or ("VALID ALERT" if valid else "FALSE POSITIVE"),
+            "validation_summary": response["validation_summary"],
+            "cam_name": cam,
+            "claimed_triggers": [str(t) for t in claimed.get("triggers") or []],
+            "claimed_people_count": claimed.get("people_count"),
+            "ai_people_count": ai_people,
+            "what_happened": analysis.get("what_happened"),
+            "why_it_happened": analysis.get("why_it_happened"),
+            "recommendation": analysis.get("recommendation"),
+            "roi_labels": sorted({roi["label"] for roi in response["event_roi"]}),
+            "media_analyzed": response["media_analyzed"],
         }

@@ -33,13 +33,15 @@ class ExtractionTask(BaseTask):
             text = text.strip()
         return json.loads(text)
 
-    def key_fields(self, response: Dict) -> Dict[str, Any]:
+    def record(self, response: Dict) -> Dict[str, Any]:
         detections = [d for d in response["detections"] if isinstance(d, dict)]
         plates = [str((d.get("attributes") or {}).get("plate_number", "")).strip()
                   for d in detections if d.get("label") == "license_plate"]
         return {
-            "alert_valid": None,
-            "plate_number": next((p for p in plates if p and p.lower() != "string"), None),
+            "person_count": response.get("person_count", 0),
+            "vehicle_count": response.get("vehicle_count", 0),
+            "dog_count": response.get("dog_count", 0),
             "labels": sorted({d["label"] for d in detections}),
-            "severity": None,
+            "plate_numbers": [p for p in plates if p and p.lower() != "string"],
+            "detections": json.dumps(detections, ensure_ascii=False),
         }

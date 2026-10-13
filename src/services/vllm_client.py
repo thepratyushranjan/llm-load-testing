@@ -200,8 +200,9 @@ async def _try(args) -> int:
                 print(f"  ⚠️  server counted {call.prompt_tokens} prompt tokens but the text alone is ~{text_tokens}: "
                       f"the prompt was probably cut to the server's context length")
             if parsed:
+                stored = {k: v for k, v in parsed.record.items() if k not in ("response_json", "detections")}
                 print(f"  json_ok={parsed.json_parse_ok} schema_ok={parsed.schema_valid} "
-                      f"key_fields={parsed.key_fields} {parsed.error or ''}")
+                      f"{stored or ''} {parsed.error or ''}")
                 if args.show:
                     print(json.dumps(parsed.parsed, indent=2)[:3000] if parsed.parsed else call.text[:3000])
         return 1 if failed else 0

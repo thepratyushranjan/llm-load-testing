@@ -80,12 +80,12 @@ class ClickHouseDatabase:
         return False
     
     def init_schema(self) -> None:
-        """Create load-test tables and views if they don't exist"""
+        """Create the three response tables if they don't exist (and add any new columns)"""
         from src.models.tables import SCHEMA_STATEMENTS
 
         for statement in SCHEMA_STATEMENTS:
             self.execute_command(statement)
-        print(f"✅ Load-test schema ready ({len(SCHEMA_STATEMENTS)} objects)")
+        print("✅ Response tables ready: event_responses, ai_info_responses, image_analysis_responses")
 
     def get_version(self) -> Optional[str]:
         """Get ClickHouse server version"""

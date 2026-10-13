@@ -1,24 +1,22 @@
 import asyncio
-import json
 import random
 import statistics
 import time
 from collections import deque
-from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from src.core import keys
 from src.core.profiles import RunSpec, Step
 from src.models.dataset import ManifestRow
-from src.models.job import Job, now_ms
+from src.models.job import now_ms
 from src.services.base import BaseService
 from src.services.event_meta import EventMetaLoader
 from src.services.job_builder import JobBuilder
 from src.services.job_queue import ControlState, ControlWatcher, JobQueue
+from src.services import run_stats
 from src.services.manifest import load_manifest
 
 AUTO_STOP_CHECK_S = 10
-ERROR_STATUSES = ("error", "timeout", "rate_limited", "expired", "dlq")
 
 
 class CasePicker:
@@ -67,7 +65,6 @@ class Scheduler(BaseService):
     """Executes the run the CLI submits: open-loop ticks per profile step, drain + cooldown, auto-stop"""
 
     name = "scheduler"
-    uses_clickhouse = True
 
     async def setup(self) -> None:
         await super().setup()
@@ -158,33 +155,19 @@ class Scheduler(BaseService):
         await self.redis.hset(keys.RUN_PROGRESS_KEY, mapping={k: str(v) for k, v in fields.items()})
 
     async def write_run_row(self, spec: RunSpec, ended: bool, notes: str) -> None:
-        """lt_runs is a ReplacingMergeTree: the end-of-run row replaces the start row"""
+        """Run settings, start / end and outcome, kept in Redis next to the run's live stats"""
         s = self.settings
-        if not ended:
-            self._started_dt = datetime.now(timezone.utc)
-        started = getattr(self, "_started_dt", None) or datetime.now(timezone.utc)
-        vllm_config = {"vllm_url": s.vllm_url, "extra_body": s.extra_body, "video_input": s.video_input,
-                       "video_side": s.video_side, "tick_seconds": s.tick_seconds,
-                       "functions": spec.functions, "profile": spec.profile.model_dump()}
-        row = [spec.run_id, s.machine_id, spec.profile.name, s.model, json.dumps(vllm_config),
-               s.worker_concurrency, s.max_pixels,
-               s.video_frames if s.video_input == "frames" else None, s.video_fps or None,
-               0, int(s.guided_json), started, datetime.now(timezone.utc) if ended else None, notes]
-        cols = ["run_id", "machine_id", "profile", "model", "vllm_config", "worker_concurrency", "max_pixels",
-                "video_num_frames", "video_fps", "prefix_cache", "guided_json", "started_at", "ended_at", "notes"]
-        for attempt in range(12):  # ClickHouse may be restarting; never fail the run over its bookkeeping row
-            try:
-                await asyncio.to_thread(self.db.insert, "lt_runs", [row], cols)
-                break
-            except Exception as e:
-                self.log.warning(f"lt_runs write failed (attempt {attempt + 1}): {e}")
-                await asyncio.sleep(5)
-                if not self.db.ping():
-                    await asyncio.to_thread(self.db.connect)
-        else:
-            self.log.error(f"Giving up on the lt_runs row for {spec.run_id}")
+        info = {"run_id": spec.run_id, "machine_id": s.machine_id, "profile": spec.profile.name, "model": s.model,
+                "functions": ",".join(spec.functions), "notes": notes}
         if ended:
-            self._started_dt = None
+            info["ended_ms"] = now_ms()
+        else:
+            info.update(started_ms=now_ms(), vllm_url=s.vllm_url, worker_concurrency=s.worker_concurrency,
+                        max_pixels=s.max_pixels, video_input=s.video_input, guided_json=int(s.guided_json),
+                        profile_json=spec.profile.model_dump_json())
+        key = keys.run_info_key(spec.run_id)
+        await self.redis.hset(key, mapping={k: str(v) for k, v in info.items()})
+        await self.redis.expire(key, run_stats.STATS_TTL_S)
 
     # ── steps ────────────────────────────────────────────────────────────
 
@@ -283,18 +266,16 @@ class Scheduler(BaseService):
             try:
                 if await self.auto_stop_check(window, growth_s, max_err, sla):
                     return
-            except Exception as e:  # e.g. ClickHouse restarting: skip this check, keep monitoring
+            except Exception as e:  # e.g. Redis hiccup: skip this check, keep monitoring
                 self.log.warning(f"Auto-stop check skipped: {e}")
 
     async def auto_stop_check(self, window: deque, growth_s: float, max_err: float, sla: float) -> bool:
         # Backlog = jobs waiting in Redis + requests waiting inside vLLM. Workers pull jobs at once,
         # so when the GPU saturates the queue builds up at the server first.
         stats = await self.queue.stats()
-        [server] = await asyncio.to_thread(self.db.query_rows, """
-            SELECT argMax(requests_waiting, ts) AS waiting, count() AS n
-            FROM lt_server_metrics WHERE run_id = {run:String} AND ts >= now64(3) - INTERVAL 15 SECOND""",
-            {"run": self.spec.run_id})
-        backlog = stats["jobs_waiting"] + (int(server["waiting"]) if server["n"] else 0)
+        server = await self.redis.hgetall(keys.SERVER_METRICS_KEY)
+        fresh = server and now_ms() - int(server.get("ts_ms", 0)) <= 15_000
+        backlog = stats["jobs_waiting"] + (int(float(server.get("requests_waiting", 0))) if fresh else 0)
         now = time.monotonic()
         window.append((now, backlog))
         while window and now - window[0][0] > growth_s:
@@ -307,17 +288,11 @@ class Scheduler(BaseService):
             self.abort_reason = (f"backlog (queue + vLLM waiting) grew {depths[0]} → {depths[-1]} over "
                                  f"{growth_s:.0f}s (beyond capacity)")
         else:
-            [m] = await asyncio.to_thread(self.db.query_rows, f"""
-                SELECT count() AS n,
-                       countIf(status IN {ERROR_STATUSES}) AS failed,
-                       quantileIf(0.95)(e2e_ms, status = 'ok') AS p95
-                FROM lt_requests
-                WHERE run_id = {{run:String}} AND created_ts >= now64(3) - INTERVAL 60 SECOND""",
-                {"run": self.spec.run_id})
-            if m["n"] >= 20 and m["failed"] / m["n"] > max_err:
-                self.abort_reason = f"error rate {m['failed'] / m['n']:.1%} > {max_err:.1%} in the last minute"
-            elif sla and m["n"] >= 20 and m["p95"] and m["p95"] > sla:
-                self.abort_reason = f"p95 latency {m['p95']:.0f}ms > SLA {sla:.0f}ms in the last minute"
+            m = run_stats.last_minute(await run_stats.load(self.redis, self.spec.run_id, last=5000), now_ms())
+            if m["rows"] >= 20 and m["failed"] / m["rows"] > max_err:
+                self.abort_reason = f"error rate {m['failed'] / m['rows']:.1%} > {max_err:.1%} in the last minute"
+            elif sla and m["rows"] >= 20 and m["p95_e2e_ms"] and m["p95_e2e_ms"] > sla:
+                self.abort_reason = f"p95 latency {m['p95_e2e_ms']:.0f}ms > SLA {sla:.0f}ms in the last minute"
         if self.abort_reason:
             self.log.warning(f"Auto-stop: {self.abort_reason}")
             await self.progress(abort_reason=self.abort_reason)

@@ -7,8 +7,8 @@ Load testing and performance benchmarking for roboi's vision LLM (**event**, **A
 ## Architecture
 
 - **FastAPI**: web framework for the project API
-- **Redis**: job queue (Redis Streams), run control
-- **ClickHouse** (24.9): results and metrics storage
+- **Redis**: job queue (Redis Streams), run control, live load-test numbers
+- **ClickHouse** (24.9): the 3 response tables (event, AI-info, image analysis)
 - **Grafana**: dashboards
 - **Docker Compose**: all services: `scheduler`, `worker`, `ch-writer`, `metrics-poller`, `api`, `redis`, `clickhouse`, `grafana`
 - **Model under test**: any OpenAI-compatible server: E2E vLLM, local Ollama, or the built-in mock
@@ -89,7 +89,7 @@ A plain folder of images also works. See [LOAD_TESTING.md §3](LOAD_TESTING.md#3
 ### 3. Run
 
 ```bash
-./run.sh                       # smoke test, repeated until Ctrl+C
+./run.sh                       # the test set by PROFILE in .env, repeated until Ctrl+C
 ```
 
 That one command:
@@ -97,7 +97,8 @@ That one command:
 2. starts all services and waits until they are healthy
 3. checks the model server is up and `MODEL` is loaded
 4. scans the dataset and prepares the image cache
-5. runs the test round after round, prints results, exports each run to `data/exports/`
+5. shows how many event / AI-info cases use your `payload.json` (warns about cases without one)
+6. runs the test round after round, prints results, exports each run to `data/exports/`
 
 Press **Ctrl+C** to stop: sending stops at once and the queue is cleared. Output is saved to `data/logs/`.
 
@@ -264,8 +265,8 @@ docker compose logs -f clickhouse
 
 ### Apply code or .env changes
 ```bash
-docker compose up -d --build --force-recreate
-docker compose --profile tools build          # the dataset / ./lt tool image
+docker compose build                  # one image (llm-load-testing:latest) used by every service and ./lt
+docker compose up -d --force-recreate
 ```
 
 ## Environment Variables
@@ -301,7 +302,14 @@ curl 'http://localhost:8123/?query=SELECT%201'
 docker exec -it clickhouse-db clickhouse-client
 ```
 
-Load test tables: `lt_runs`, `lt_requests`, `lt_responses`, `lt_server_metrics`, `lt_requests_1m`.
+ClickHouse has only these three tables. Each row also holds that request's speed (`ttft_ms`, `model_latency_ms`, `e2e_ms`, tokens). Failed requests and live numbers are kept in Redis (`./lt status`).
+
+
+| Table | Holds |
+|---|---|
+| `event_responses` | Valid event responses: verdict (valid alert / false positive), summary, people count … |
+| `ai_info_responses` | Valid AI-info responses: flagged KPIs, counts, scores, summary … |
+| `image_analysis_responses` | Valid image search responses: counts, objects found, plates, attributes |
 
 ## License
 

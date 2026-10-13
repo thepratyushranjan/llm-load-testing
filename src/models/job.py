@@ -63,7 +63,7 @@ class Job(BaseModel):
 
 
 class Result(BaseModel):
-    """One row of lt_requests (one per attempt) plus the optional response body"""
+    """One request attempt: speed and status (live stats in Redis) plus the response row when the response was valid"""
     machine_id: str
     run_id: str
     step: int
@@ -96,10 +96,8 @@ class Result(BaseModel):
     json_parse_ok: Optional[bool] = None
     schema_valid: Optional[bool] = None
 
-    raw_text: Optional[str] = None
-    parsed_json: Optional[Dict] = None
     prompt_version: Optional[str] = None
-    key_fields: Optional[Dict] = None  # alert_valid, plate_number, labels, severity
+    record: Optional[Dict] = None  # valid response → row of event_ / ai_info_ / image_analysis_responses
 
     def to_stream(self) -> Dict[str, str]:
         return {"result": self.model_dump_json()}

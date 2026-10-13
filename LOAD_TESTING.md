@@ -63,7 +63,7 @@ Everything runs in Docker Compose. Each machine runs its **own clone independent
         │ result
         ▼
  ┌────────────┐                ┌────────────┐
- │ ch-writer  │──────────────► │ ClickHouse │ ◄── metrics-poller (vLLM /metrics every few s)
+ │ ch-writer  │──────────────► │ ClickHouse │  3 tables: event / ai_info / image_analysis responses
  └────────────┘  batch insert  └────────────┘
                                       ▲
                        ./lt status · ./lt export · Grafana
@@ -73,10 +73,10 @@ Everything runs in Docker Compose. Each machine runs its **own clone independent
 |---|---|
 | **scheduler** | Always on and idle until a run is submitted. Sends jobs at the profile's rate (open loop: it keeps the schedule even when the model is slow), drains at the end, runs auto-stop. |
 | **worker** | Pulls jobs (up to `WORKER_CONCURRENCY` at once), calls the model with streaming, measures timings, parses and validates the output, handles retries and timeouts. |
-| **ch-writer** | Writes results to ClickHouse in batches; never loses or duplicates a result, even across a ClickHouse restart. |
-| **metrics-poller** | Reads vLLM's Prometheus `/metrics` (running/waiting requests, KV cache, prefix-cache hits, tokens/s, GPU) and tags each sample with the run id. |
-| **redis** | Job queue, results stream, run state, control (run / pause / stop). |
-| **clickhouse** | All results and metrics. |
+| **ch-writer** | Writes valid responses (with their speed) to the 3 ClickHouse tables in batches; never loses or duplicates one, even across a ClickHouse restart. |
+| **metrics-poller** | Reads vLLM's Prometheus `/metrics` (running/waiting requests, KV cache, prefix-cache hits, tokens/s) into Redis for auto-stop and `./lt status`. |
+| **redis** | Job queue, results stream, run state and live stats, vLLM metrics, control (run / pause / stop). |
+| **clickhouse** | The 3 response tables (event, AI-info, image analysis). |
 | **grafana** | http://localhost:3000, with the ClickHouse plugin installed (no ready-made dashboard yet). |
 | **api** | The project's FastAPI app (port 8000). |
 | **dataset** *(tool)* | One-off commands: manifest, preencode, CLI (`./lt`). |
@@ -227,7 +227,7 @@ steps:
 ### 6.1 One command: `run.sh`
 Starts everything, checks the model, prepares the data, then runs tests **round after round until you press Ctrl+C**.
 ```
-./run.sh                                   # smoke, repeated until Ctrl+C
+./run.sh                                   # PROFILE from .env (e.g. PROFILE=ramp), repeated until Ctrl+C
 ./run.sh baseline ramp spike               # these profiles in order, repeated
 ./run.sh --once ramp                       # run once, then exit
 ./run.sh ramp -- --rate-scale 0.1          # extra options passed to ./lt run
@@ -236,8 +236,9 @@ What it does:
 1. **Checks:** `.env` exists, Docker is running, prints `MODEL` / `VLLM_URL` / `DATASET_DIR`.
 2. **Services:** `docker compose up -d --wait` (until all are healthy).
 3. **Model:** the server is reachable and `MODEL` is loaded; otherwise it exits with a clear error.
-4. **Data:** manifest + preencode (only new files are processed).
-5. **Rounds:** each profile with live progress, the results table, and an automatic export to `data/exports/<run_id>/`.
+4. **Data:** manifest + preencode (only new files are processed). Stops with a clear error if either fails.
+5. **JSON check:** how many event / AI-info cases use your `payload.json`, with a warning for cases that would use generated JSON.
+6. **Rounds:** each profile with live progress, the results table, and an automatic export to `data/exports/<run_id>/`.
 
 **Ctrl+C:** sending stops immediately, the queue is cleared, and the final status is printed. Services stay up for the next run (`docker compose down` stops them). All output is saved to `data/logs/run-<time>.log`.
 
@@ -307,28 +308,42 @@ The reason is logged (`⛔ Auto-stop: ...`) and stored with the run. In a **ramp
 
 ## 9. What is measured
 
-### Per request (`lt_requests`)
+ClickHouse holds **only three tables**: `event_responses`, `ai_info_responses` and `image_analysis_responses`. Live numbers for every request (including failures) are kept in **Redis** while a test runs.
+
+### Per request (Redis, live)
+Every request attempt adds one entry to the run's live stats (`lt:run:stats:<run_id>`, kept 7 days). `./lt status`, auto-stop and the end-of-run table are computed from it.
+
 | Metric | Meaning |
 |---|---|
-| `queue_wait_ms` | Created → picked up by a worker (test-side queueing) |
-| `ttft_ms` | Sent → **first token** (includes prefill of images + prompt; reasoning tokens count) |
-| `model_latency_ms` | Sent → last token (pure model time) |
-| `e2e_ms` | Created → done (what a user would wait) |
-| `writer_lag_ms` | Done → stored |
-| `prompt_tokens`, `completion_tokens`, `cached_tokens` | From the server's usage report |
-| `n_images`, `n_videos`, `media_bytes`, `video_duration_s`, `num_frames` | Request size |
+| `ttft` | Sent → **first token** (includes prefill of images + prompt; reasoning tokens count) |
+| `e2e` | Scheduled → done (what a user would wait) |
 | `status` | `ok`, `error`, `timeout`, `rate_limited`, `expired`, `dlq` |
-| `http_status`, `error_type` | Failure detail |
-| `json_parse_ok`, `schema_valid` | Was the output valid JSON in the production shape? |
+| `json_ok`, `schema_ok` | Was the output valid JSON in the production shape? |
 
-### Per response (`lt_responses`)
-The raw text, parsed JSON and key fields: `alert_valid` (event verdict / AI-info flagged), `labels` (detected objects or flagged KPIs), `plate_number`, `severity`. Image search output is stored here, in the load tester's own ClickHouse, never in production.
+### Model responses: one table per function
+Only **valid** responses are stored, meaning correct JSON in the production format after the same `_format_response` as production. Invalid replies and failed requests are not stored in ClickHouse; they are counted in the live stats (`json_ok` / `schema_ok`, `failed`).
 
-### Server side (`lt_server_metrics`, vLLM only)
-`requests_running`, `requests_waiting`, `kv_cache_usage`, `prefix_cache_hit_rate`, `prompt_tokens_per_s`, `generation_tokens_per_s`, `gpu_util`, `gpu_mem_used_bytes`.
+Every response table has:
+- **Identity:** `run_id`, `machine_id`, `job_id`, `attempt`, `model`, `case_id`, `split`, `prompt_version`, `inserted_ts`
+- **Speed of that request:** `created_ts`, `step` (load level), `ttft_ms` (sent → first token), `model_latency_ms` (sent → last token), `e2e_ms` (scheduled → done), `prompt_tokens`, `completion_tokens`, `n_images`
+- **The response:** the columns below, plus `response_json` (the full production-format response)
 
-### Per minute (`lt_requests_1m`)
-A materialized rollup with counts and latency quantiles per minute, function and status, for fast dashboards.
+| Table | Function | Main columns |
+|---|---|---|
+| **`event_responses`** | event | `alert_valid` (1 = valid alert, 0 = false positive), `verdict`, `validation_summary`, `cam_name`, `claimed_triggers`, `claimed_people_count`, `ai_people_count`, `what_happened`, `why_it_happened`, `recommendation`, `roi_labels`, `media_analyzed` |
+| **`ai_info_responses`** | ai_info | `status`, `utilization`, `critical_alerts` / `high_alerts` / `medium_alerts` / `low_alerts` (the KPIs flagged), `total_issues`, `people_count`, `employee_count`, `visitor_count`, `contractor_count`, `unidentified_count`, `safety_score`, `cleanliness_score`, `uniform_compliance_score`, `access_compliance_score`, `overall_compliance_score`, `overall_compliance_pct`, `zone_type`, `occupancy_level`, `triggers`, `ai_summary`, `cam_name`, `site_name`, `media_analyzed` |
+| **`image_analysis_responses`** | extraction (image search) | `person_count`, `vehicle_count`, `dog_count`, `labels` (objects found), `plate_numbers`, `detections` (JSON: label + attributes per object) |
+
+These live in the load tester's own ClickHouse, never in production.
+
+```sql
+SELECT verdict, count() FROM event_responses WHERE run_id = '<run_id>' GROUP BY verdict;
+SELECT status, avg(people_count), avg(overall_compliance_pct) FROM ai_info_responses GROUP BY status;
+SELECT arrayJoin(labels) AS object, count() FROM image_analysis_responses GROUP BY object ORDER BY count() DESC;
+```
+
+### Server side (Redis, vLLM only)
+The latest vLLM `/metrics` sample (`lt:server`), shown by `./lt status` and used by auto-stop: `requests_running`, `requests_waiting`, `kv_cache_usage`, `prefix_cache_hit_rate`, `prompt_tokens_per_s`, `generation_tokens_per_s`.
 
 ### Test machine health
 Worker CPU %, in-flight count and **event-loop lag**, shown in `./lt status`. If the lag is high, the test machine itself is the bottleneck and its numbers can't be trusted.
@@ -379,7 +394,9 @@ journalctl -u ollama -f        # local Ollama only
 
 ```
 ./lt status                    # final table per step and function: rows, ok, p50, p95, TTFT, schema_ok
-./lt export                    # last run → data/exports/<run_id>/{lt_runs,lt_requests,lt_responses,lt_server_metrics}.parquet
+./lt export                    # last run → data/exports/<run_id>/
+                               #   event_responses / ai_info_responses / image_analysis_responses .parquet
+                               #   summary.json: run settings + speed and errors per step and function
 ```
 
 Example ClickHouse queries:
@@ -387,24 +404,21 @@ Example ClickHouse queries:
 docker compose exec clickhouse clickhouse-client
 ```
 ```sql
--- latency and errors per function for the latest run
-SELECT function, count() AS n, countIf(status != 'ok') AS failed,
-       round(quantile(0.5)(e2e_ms)) AS p50_ms, round(quantile(0.95)(e2e_ms)) AS p95_ms,
-       round(quantile(0.95)(ttft_ms)) AS p95_ttft_ms, round(avg(schema_valid) * 100, 1) AS schema_ok_pct
-FROM lt_requests
-WHERE run_id = (SELECT max(run_id) FROM lt_requests)
-GROUP BY function;
+-- speed of valid responses per function for a run
+SELECT 'event' AS function, count() AS n, round(quantile(0.5)(e2e_ms)) AS p50_ms, round(quantile(0.95)(e2e_ms)) AS p95_ms,
+       round(quantile(0.95)(ttft_ms)) AS p95_ttft_ms FROM event_responses WHERE run_id = '<run_id>'
+UNION ALL
+SELECT 'ai_info', count(), round(quantile(0.5)(e2e_ms)), round(quantile(0.95)(e2e_ms)), round(quantile(0.95)(ttft_ms))
+FROM ai_info_responses WHERE run_id = '<run_id>'
+UNION ALL
+SELECT 'image_analysis', count(), round(quantile(0.5)(e2e_ms)), round(quantile(0.95)(e2e_ms)), round(quantile(0.95)(ttft_ms))
+FROM image_analysis_responses WHERE run_id = '<run_id>';
 
--- throughput and latency per ramp step (find where it breaks)
-SELECT step, count() / (dateDiff('second', min(created_ts), max(created_ts)) + 1) AS rps,
-       round(quantile(0.95)(e2e_ms)) AS p95_ms, countIf(status != 'ok') AS failed
-FROM lt_requests WHERE run_id = '<run_id>' GROUP BY step ORDER BY step;
-
--- GPU server state during the run (vLLM)
-SELECT toStartOfMinute(ts) AS m, avg(requests_running), max(requests_waiting),
-       max(kv_cache_usage), avg(generation_tokens_per_s), avg(prefix_cache_hit_rate)
-FROM lt_server_metrics WHERE run_id = '<run_id>' GROUP BY m ORDER BY m;
+-- latency per ramp step (find where it breaks)
+SELECT step, count() AS n, round(quantile(0.95)(e2e_ms)) AS p95_ms
+FROM event_responses WHERE run_id = '<run_id>' GROUP BY step ORDER BY step;
 ```
+Failures and error rates are in `./lt status` and `summary.json`, since failed requests have no valid response to store.
 
 **Reading a ramp:** the capacity is the **highest step where p95 stays flat, errors stay at 0 and `jobs_waiting` doesn't grow**. Use ~70% of it for the soak test and for production planning.
 
@@ -421,7 +435,7 @@ Load testing is about speed, but every response is also checked:
   event_002,event,false,
   cam1_0001,extraction,,person|chair|bottle
   ```
-  `image_id` = event folder name, image file name or case id. The model's verdicts are in `lt_responses.alert_valid` / `labels`, compared per case.
+  `image_id` = event folder name, image file name or case id. The model's answers are in `event_responses.alert_valid` and `image_analysis_responses.labels`, compared per case.
   ```
   docker compose run --rm dataset python -m src.services.ground_truth     # how many cases are labelled
   ```
@@ -478,7 +492,7 @@ All in `.env` (see `.env.example`). Main ones:
 | `MAX_RETRIES`, `MAX_DELIVERIES`, `RETRY_BACKOFF_S` | `2`, `3`, `1.0` | Retry policy |
 | `MAX_RPS`, `RATE_BURST` | `0` | Optional rate cap |
 | `MAX_PIXELS` | `1003520` | Image resolution sent to the model |
-| `IMAGE_VARIANTS_PX`, `VIDEO_VARIANTS_SIDE` | | Cached sizes |
+| `IMAGE_VARIANTS_PX`, `VIDEO_VARIANTS_SIDE` | `1003520`, `1280` | Sizes prepared in the cache (comma list to prepare more; `MAX_PIXELS` / `VIDEO_SIDE` must be one of them) |
 | `VIDEO_INPUT`, `VIDEO_FRAMES`, `VIDEO_SIDE` | `video`, `4`, `1280` | How video is sent |
 | `VIDEO_MAX_SECONDS`, `VIDEO_FPS`, `JPEG_QUALITY` | `10`, `0`, `90` | Media preparation |
 | `GUIDED_JSON` | `false` | Force JSON schema output (vLLM) |
@@ -506,7 +520,7 @@ src/
     keys.py                  Redis key names
     logging.py, healthcheck.py
   models/
-    tables.py                ClickHouse tables and rollup
+    tables.py                the 3 ClickHouse response tables
     job.py                   Job / Result models
     dataset.py               manifest row, cache entry, event metadata, ground truth
   schemas/responses.py       production response schemas (event, ai-info, extraction)
@@ -522,8 +536,9 @@ src/
     job_queue.py             Redis Streams queue, retries, DLQ, idempotency, control
     scheduler.py             open-loop scheduler, drain, auto-stop
     worker.py                concurrent request execution
-    ch_writer.py             batched, deduplicated ClickHouse writes
-    metrics_poller.py        vLLM Prometheus metrics
+    ch_writer.py             batched, deduplicated writes of valid responses
+    run_stats.py             live per-request stats in Redis (status, auto-stop, summary)
+    metrics_poller.py        vLLM Prometheus metrics → Redis
     mock_vllm.py             fake GPU server
     prompt_snapshot.py       dev tool: re-render prompts from a roboi-main checkout
     cli.py                   ./lt commands
@@ -545,4 +560,4 @@ data/                        (not in git) manifest, cache, exports, logs, ground
 | Event cases use `synthetic` JSON | Add `payload.json` event folders (§3) |
 | `metrics-poller` 404 | Normal with Ollama |
 | Service unhealthy | `docker compose ps`, `docker compose logs <service>` |
-| Changed code or `.env` not applied | `docker compose up -d --build --force-recreate` |
+| Changed code or `.env` not applied | `docker compose build`, then `docker compose up -d --force-recreate` (one image serves every service; `run.sh` never builds) |

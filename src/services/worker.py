@@ -175,7 +175,7 @@ class Worker(BaseService):
                     parse_error = "format_error" if (parsed.error or "").startswith("format") else "schema_invalid"
                 result = result.model_copy(update={
                     "json_parse_ok": parsed.json_parse_ok, "schema_valid": parsed.schema_valid,
-                    "raw_text": call.text, "parsed_json": parsed.parsed, "key_fields": parsed.key_fields or None,
+                    "record": parsed.record or None,
                     "prompt_version": prompts.PROMPT_VERSION,
                     "error_type": call.error_type or parse_error,
                 })

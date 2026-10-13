@@ -39,7 +39,6 @@ class Settings(BaseSettings):
     # Load Shape Settings
     profile: str = "smoke"
     tick_seconds: float = 5.0
-    batch_size: int = 1
     functions: str = "event,ai_info,extraction"
     job_deadline_s: float = 30.0
     max_pixels: int = 1003520
@@ -89,8 +88,8 @@ class Settings(BaseSettings):
 
     # Dataset Settings
     machines: str = "A,B,C"
-    image_variants_px: str = "1003520,401408"  # max_pixels per image variant
-    video_variants_side: str = "1280,640"      # max long side per video variant
+    image_variants_px: str = "1003520"  # max_pixels per image variant
+    video_variants_side: str = "1280"      # max long side per video variant
     video_max_seconds: float = 10.0            # trim clips to this length (0 = keep)
     video_fps: float = 0.0                     # re-time clips to this fps (0 = keep)
     jpeg_quality: int = 90

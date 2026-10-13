@@ -177,13 +177,29 @@ class AiInfoTask(BaseTask):
             },
         }
 
-    def key_fields(self, response: Dict) -> Dict[str, Any]:
-        flagged = set()
-        for tier in ("critical_alerts", "high_alerts", "medium_alerts", "low_alerts"):
-            flagged |= {kpi for kpi, value in response[tier].items() if value == 1}
+    def record(self, response: Dict) -> Dict[str, Any]:
+        def flagged(tier: str):
+            return sorted(k for k, v in response[tier].items() if v == 1 and k != "issue_timestamp_offset")
+
+        meta, scores, counts = response["metadata"], response["scores"], response["counts"]
         return {
-            "alert_valid": bool(flagged),
-            "plate_number": None,
-            "labels": sorted(flagged),
-            "severity": response["classification"]["status"],
+            "cam_name": meta.get("cam_name"),
+            "site_name": meta.get("site_name"),
+            "status": response["classification"]["status"],
+            "utilization": response["classification"]["utilization"],
+            "critical_alerts": flagged("critical_alerts"),
+            "high_alerts": flagged("high_alerts"),
+            "medium_alerts": flagged("medium_alerts"),
+            "low_alerts": flagged("low_alerts"),
+            "total_issues": response["aggregates"]["total_issues_count"],
+            **{k: counts[k] for k in ("people_count", "employee_count", "visitor_count", "contractor_count",
+                                      "unidentified_count")},
+            **{k: scores[k] for k in ("safety_score", "cleanliness_score", "uniform_compliance_score",
+                                      "access_compliance_score", "overall_compliance_score")},
+            "overall_compliance_pct": response["aggregates"]["overall_compliance_pct"],
+            "zone_type": response["zone_analysis"]["zone_type"],
+            "occupancy_level": response["zone_analysis"]["occupancy_level"],
+            "triggers": [str(t) for t in response["triggers"]],
+            "ai_summary": response["ai_summary"],
+            "media_analyzed": meta["media_analyzed"],
         }

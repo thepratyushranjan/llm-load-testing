@@ -27,7 +27,7 @@ class ParsedResponse:
     json_parse_ok: bool = False
     schema_valid: bool = False
     error: Optional[str] = None
-    key_fields: Dict[str, Any] = field(default_factory=dict)
+    record: Dict[str, Any] = field(default_factory=dict)  # row for the function's response table
 
 
 class BaseTask:
@@ -128,11 +128,11 @@ class BaseTask:
             )
             return result
         result.schema_valid = True
-        result.key_fields = self.key_fields(formatted)
+        result.record = {**self.record(formatted), "response_json": json.dumps(formatted, ensure_ascii=False)}
         return result
 
-    def key_fields(self, response: Dict) -> Dict[str, Any]:
-        """Fields compared against ground truth: alert_valid, plate_number, labels, severity"""
+    def record(self, response: Dict) -> Dict[str, Any]:
+        """Function-specific columns of the response table, from a valid production response"""
         raise NotImplementedError
 
 
