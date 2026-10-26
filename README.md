@@ -11,7 +11,7 @@ Load testing and performance benchmarking for roboi's vision LLM (**event**, **A
 - **ClickHouse** (24.9): the 3 response tables (event, AI-info, image analysis)
 - **Grafana**: dashboards
 - **Docker Compose**: all services: `scheduler`, `worker`, `ch-writer`, `metrics-poller`, `api`, `redis`, `clickhouse`, `grafana`
-- **Model under test**: any OpenAI-compatible server: E2E vLLM, local Ollama, or the built-in mock
+- **Model under test**: a vision model on an **E2E TIR** vLLM inference endpoint (OpenAI-compatible API, called with the `openai` SDK)
 
 ```
 ./run.sh → scheduler → Redis queue → worker → MODEL → ch-writer → ClickHouse → ./lt status / export / Grafana
@@ -42,7 +42,7 @@ llm-load-testing/
 ## Prerequisites
 
 - Docker and Docker Compose
-- A model server: E2E vLLM URL, **or** local [Ollama](https://ollama.com) with a vision model, **or** the built-in mock
+- An E2E TIR inference endpoint (vLLM) serving a vision model, and its auth token
 - A folder of test images (and real event folders, see below)
 
 ## Quick Start: Load Testing
@@ -56,19 +56,21 @@ cp .env.example .env
 Set at least:
 
 ```bash
-# Model under test, E2E vLLM:
-VLLM_URL=https://<e2e-host>/v1
-VLLM_API_KEY=<key>
-MODEL=<served model name>
-
-# …or local Ollama (running on the host, not in Docker):
-# VLLM_URL=http://host.docker.internal:11434/v1
-# MODEL=gemma4-16k:latest
-# VIDEO_INPUT=frames
-# EXTRA_BODY='{"reasoning_effort": "none"}'
+# Model under test: E2E TIR endpoint (all three required; copy them from the endpoint page)
+VLLM_URL=https://infer.e2enetworks.net/project/<p-id>/endpoint/<is-id>/v1
+VLLM_API_KEY=<TIR auth token>
+MODEL=<served model name, e.g. Qwen/Qwen3.6-35B-A3B-FP8>
+# Qwen3 / Qwen3.6: answer without thinking
+# EXTRA_BODY='{"chat_template_kwargs": {"enable_thinking": false}}'
 
 # Your test data folder (read-only, never copied or uploaded)
 DATASET_DIR=/path/to/test_data
+```
+
+Check the endpoint, token and model name (one `GET /models`, no GPU time):
+
+```bash
+docker compose run --rm -T dataset python -m src.services.vllm_client --check
 ```
 
 ### 2. Prepare test data
@@ -166,8 +168,6 @@ This will start:
 - FastAPI application on port 8000
 - Redis on 127.0.0.1:6379, Grafana on http://localhost:3000
 - scheduler, worker, ch-writer, metrics-poller
-
-Optional mock model server (no GPU needed): `docker compose --profile mock up -d mock-vllm` with `VLLM_URL=http://mock-vllm:8000/v1`.
 
 ### 2. Prepare the dataset
 

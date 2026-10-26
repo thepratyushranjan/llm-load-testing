@@ -38,6 +38,7 @@ class BaseTask:
     response_schema: TypeAdapter    # dict production returns after _format_response
     temperature: float = 0.4
     max_tokens: int = 2048
+    sampling: Dict[str, Any] = {}  # extra sampling params for this function, e.g. presence_penalty
     text_first: bool = False  # production order of text vs media parts
 
     def __init__(self, settings: Optional[Settings] = None):
@@ -76,7 +77,10 @@ class BaseTask:
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            **self.sampling,
         }
+        if self.settings.isolate_prefix_cache:  # production images are unique; the test set repeats
+            body["cache_salt"] = job.job_id
         if self.settings.guided_json if guided_json is None else guided_json:
             body["response_format"] = {
                 "type": "json_schema",

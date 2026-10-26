@@ -16,7 +16,8 @@ class ExtractionTask(BaseTask):
     output_schema = ExtractionResponse
     response_schema = TypeAdapter(ExtractionResponse)
     temperature = 0.2
-    max_tokens = 1024
+    max_tokens = 2048  # crowded scenes list one detection per object (~1000 tokens for 12 people + chairs)
+    sampling = {"presence_penalty": 1.0}  # without it Qwen3.6 repeats the same detection until max_tokens
     text_first = True  # production sends [prompt, image]
 
     def prompts(self, job: Job) -> Tuple[Optional[str], str]:

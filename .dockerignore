@@ -14,3 +14,8 @@ README.md
 LICENSE
 *.md
 .DS_Store
+
+# Not needed in the image: dataset/cache (mounted at runtime) and env files (passed via env_file, keeps the token out of the build context)
+data/
+.env
+.env.*

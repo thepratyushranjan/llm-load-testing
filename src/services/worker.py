@@ -129,14 +129,12 @@ class Worker(BaseService):
     def base_result(self, d: Delivery, dequeued_ts: int) -> Result:
         job = d.job
         videos = [m for m in job.media if m.kind == "video"]
-        frames = [m for m in job.media if m.path.startswith("cache/frames/")]
         return Result(
             machine_id=job.machine_id, run_id=job.run_id, step=job.step, job_id=job.job_id, attempt=job.attempt,
             model=self.settings.model, function=job.function, case_id=job.case_id, split=job.split,
-            n_images=sum(m.kind == "image" for m in job.media) - len(frames), n_videos=len(videos) + bool(frames),
+            n_images=sum(m.kind == "image" for m in job.media), n_videos=len(videos),
             media_bytes=sum(m.bytes for m in job.media),
             video_duration_s=sum(m.duration_s or 0 for m in videos) or None,
-            num_frames=len(frames) or None,
             created_ts=job.created_ts, enqueued_ts=d.enqueued_ts or None, dequeued_ts=dequeued_ts,
             status=Status.ERROR,
         )

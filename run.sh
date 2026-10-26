@@ -58,21 +58,7 @@ step "2/5 Starting services"
 docker compose up -d --wait || fail "services did not become healthy (docker compose ps / docker compose logs)"
 
 step "3/5 Checking the model"
-py -c '
-import sys, httpx
-from src.core.config import get_settings
-s = get_settings()
-headers = {"Authorization": f"Bearer {s.vllm_api_key}"} if s.vllm_api_key else {}
-try:
-    r = httpx.get(s.vllm_url.rstrip("/") + "/models", headers=headers, timeout=15)
-    r.raise_for_status()
-except Exception as e:
-    sys.exit(f"❌ model server not reachable at {s.vllm_url}: {e}")
-ids = [m["id"] for m in r.json().get("data", [])]
-if s.model not in ids:
-    sys.exit(f"❌ MODEL={s.model} not served at {s.vllm_url}; available: {ids}")
-print(f"✅ {s.model} is up at {s.vllm_url}")
-' || exit 1
+py -m src.services.vllm_client --check || exit 1
 
 step "4/5 Preparing the dataset"
 py -m src.services.manifest | tail -6 || fail "manifest failed (is DATASET_DIR in .env a folder of images / event folders?)"

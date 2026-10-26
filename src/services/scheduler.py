@@ -163,7 +163,8 @@ class Scheduler(BaseService):
             info["ended_ms"] = now_ms()
         else:
             info.update(started_ms=now_ms(), vllm_url=s.vllm_url, worker_concurrency=s.worker_concurrency,
-                        max_pixels=s.max_pixels, video_input=s.video_input, guided_json=int(s.guided_json),
+                        max_pixels=s.max_pixels, guided_json=int(s.guided_json),
+                        isolate_prefix_cache=int(s.isolate_prefix_cache),
                         profile_json=spec.profile.model_dump_json())
         key = keys.run_info_key(spec.run_id)
         await self.redis.hset(key, mapping={k: str(v) for k, v in info.items()})

@@ -30,11 +30,11 @@ class Settings(BaseSettings):
     machine_id: str = "A"
     log_level: str = "INFO"
 
-    # vLLM Settings
-    vllm_url: str = "http://mock-vllm:8000/v1"
-    vllm_api_key: str = ""
+    # vLLM Settings (E2E TIR inference endpoint, OpenAI-compatible)
+    vllm_url: str = ""          # TIR endpoint URL ending in /v1, e.g. https://infer.e2enetworks.net/project/<p-id>/endpoint/<is-id>/v1
+    vllm_api_key: str = ""      # TIR auth token, sent as Authorization: Bearer
     vllm_metrics_url: str = ""  # defaults to <vllm_url without /v1>/metrics
-    model: str = "Qwen2.5-VL-32B-Instruct"
+    model: str = ""             # served model name, as listed by GET <vllm_url>/models
 
     # Load Shape Settings
     profile: str = "smoke"
@@ -45,21 +45,9 @@ class Settings(BaseSettings):
 
     # Request Settings
     guided_json: bool = False       # constrain output to the response schema
-    extra_body: str = ""            # JSON merged into every request, e.g. {"reasoning_effort": "none"}
-    video_input: str = "video"      # video: video_url part (vLLM) | frames: N image parts (models without video, e.g. Ollama)
-    video_frames: int = 4           # frames per video when video_input=frames
+    extra_body: str = ""            # JSON merged into every request (vLLM sampling params), e.g. {"top_k": 20}
+    isolate_prefix_cache: bool = True  # unique vLLM cache_salt per job: repeated test images don't hit the prefix cache
     video_side: int = 1280          # which video variant (VIDEO_VARIANTS_SIDE) requests use; images use MAX_PIXELS
-
-    # Mock vLLM Settings (src/services/mock_vllm.py)
-    mock_max_num_seqs: int = 16             # concurrent sequences; the rest wait, like a real GPU
-    mock_prefill_tokens_per_s: float = 8000
-    mock_decode_tokens_per_s: float = 40    # per sequence
-    mock_image_tokens: int = 1000
-    mock_video_tokens: int = 4000
-    mock_error_rate: float = 0.0            # HTTP 500
-    mock_rate_limit_rate: float = 0.0       # HTTP 429 with Retry-After
-    mock_hang_rate: float = 0.0             # never answers (client timeout)
-    mock_invalid_json_rate: float = 0.0     # truncated JSON
 
     # Worker Settings
     worker_concurrency: int = 64
@@ -140,6 +128,13 @@ class Settings(BaseSettings):
     def function_list(self) -> List[str]:
         """Enabled functions parsed from the comma-separated FUNCTIONS setting"""
         return [f.strip() for f in self.functions.split(",") if f.strip()]
+
+    def require_vllm(self) -> None:
+        """Fail fast when the E2E endpoint settings the model client needs are missing"""
+        missing = [name for name, value in (("VLLM_URL", self.vllm_url), ("VLLM_API_KEY", self.vllm_api_key),
+                                            ("MODEL", self.model)) if not value.strip()]
+        if missing:
+            raise ValueError(f"{', '.join(missing)} not set in .env (E2E TIR endpoint URL, auth token, served model name)")
 
     @property
     def metrics_url(self) -> str:

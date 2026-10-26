@@ -2,7 +2,7 @@
 
 How this project load-tests the vision LLM that serves roboi's **event**, **AI-info** and **image search** functions: what each part does, how a test runs, what is measured, and how to read the results.
 
-**Target:** a ~70B vision model served by **vLLM on E2E Cloud**. During development the same tests run against a local model (Ollama `gemma4`). Only `.env` changes between the two.
+**Target:** a vision model (currently `Qwen/Qwen3.6-35B-A3B-FP8`) served by **vLLM on an E2E TIR inference endpoint**, called through its OpenAI-compatible API with the `openai` SDK.
 
 **Goal:** measure **performance, scalability, throughput, latency and resource use** of the deployed model under realistic production requests.
 
@@ -21,7 +21,7 @@ How this project load-tests the vision LLM that serves roboi's **event**, **AI-i
 10. [Monitoring and logs](#10-monitoring-and-logs)
 11. [Results and export](#11-results-and-export)
 12. [Correctness checks](#12-correctness-checks)
-13. [Local model vs E2E](#13-local-model-vs-e2e)
+13. [E2E endpoint setup](#13-e2e-endpoint-setup)
 14. [Settings reference](#14-settings-reference)
 15. [Code map](#15-code-map)
 16. [Troubleshooting](#16-troubleshooting)
@@ -59,7 +59,7 @@ Everything runs in Docker Compose. Each machine runs its **own clone independent
                                                          │
  ┌────────────┐  build request (images base64 + prompt   ▼
  │  worker    │  + JSON), stream it to the model, time it, validate the JSON
- └────────────┘──────────────► MODEL (E2E vLLM / local Ollama / mock)
+ └────────────┘──────────────► MODEL (E2E TIR vLLM endpoint)
         │ result
         ▼
  ┌────────────┐                ┌────────────┐
@@ -80,7 +80,6 @@ Everything runs in Docker Compose. Each machine runs its **own clone independent
 | **grafana** | http://localhost:3000, with the ClickHouse plugin installed (no ready-made dashboard yet). |
 | **api** | The project's FastAPI app (port 8000). |
 | **dataset** *(tool)* | One-off commands: manifest, preencode, CLI (`./lt`). |
-| **mock-vllm** *(optional)* | Fake GPU server for testing the system without a model. |
 
 ---
 
@@ -133,7 +132,7 @@ docker compose run --rm dataset python -m src.services.event_meta --show <case_i
 ```
 
 ### 3.4 How many cases you need
-You do **not** need new data for every request: the scheduler cycles through the cases. About **50–200 real events per function** is enough. With repeats, watch `prefix_cache_hit_rate` (see [§13](#13-local-model-vs-e2e)).
+You do **not** need new data for every request: the scheduler cycles through the cases. About **50–200 real events per function** is enough. Repeats don't hit vLLM's prefix cache: each job gets its own `cache_salt` (`ISOLATE_PREFIX_CACHE`, see [§13](#13-e2e-endpoint-setup)).
 
 ### 3.5 Prepare: manifest and cache
 Run this once, and again whenever the folder changes (`./run.sh` does both automatically):
@@ -165,16 +164,17 @@ Each request is an OpenAI-compatible **streaming** chat completion:
 ```
 system:  production system prompt for the function
 user:    production user prompt with the event JSON filled in
-         + images as inline base64 data URLs (+ video as video_url, or as frames)
+         + images as inline base64 data URLs (+ video as video_url)
 ```
 - **No uploads:** media, prompt and JSON go inline in the request.
 - **Streaming** with `stream_options.include_usage`, to measure time to first token and token counts.
-- **Per-function parameters** match production: event temp 0.5, max 2048 tokens; ai_info temp 0.4, max 4096; extraction temp 0.2.
+- **Per-function parameters** match production: event temp 0.5, max 2048 tokens; ai_info temp 0.4, max 4096; extraction temp 0.2, max 2048, `presence_penalty` 1.0 (without it Qwen3.6 repeats the same detection, e.g. `chair` 170×, on crowded images until the token limit).
 - **Optional guided JSON** (`GUIDED_JSON=true`): the model is forced to output the response schema (vLLM `response_format: json_schema`).
-- **`EXTRA_BODY`**: extra JSON merged into every request (e.g. `{"reasoning_effort": "none"}` for Ollama gemma4).
-- **Video:** `VIDEO_INPUT=video` sends the clip (vLLM). `VIDEO_INPUT=frames` sends `VIDEO_FRAMES` frames as images (for servers without video support, such as Ollama).
+- **`EXTRA_BODY`**: extra JSON merged into every request, e.g. `{"chat_template_kwargs": {"enable_thinking": false}}` to turn Qwen3 / Qwen3.6 thinking off.
+- **Images are the main focus.** Video is optional: a case with a video sends it as a `video_url` part (Qwen2.5-VL / Qwen3.6 accept video).
+- **Prefix cache isolation** (`ISOLATE_PREFIX_CACHE=true`, default): each job carries a unique vLLM `cache_salt`, so the repeated test images don't hit the server's prefix cache (production images are unique). Retries of a job reuse its salt.
 
-Measured prompt sizes (3 images): **ai_info ≈ 13,100 tokens**, event ≈ 5,200, extraction ≈ 750. vLLM must be started with **`--max-model-len` of at least 16384**.
+Measured prompt sizes on Qwen3.6-35B-A3B: **ai_info ≈ 14,400 tokens** (3 images), event ≈ 5,700 (3 images), extraction ≈ 1,400 (1 image). Prompt + max output must fit, so vLLM needs **`--max-model-len` of at least 20480** (ai_info: 14.4K + 4,096).
 
 Try a single request without any load:
 ```
@@ -378,13 +378,14 @@ docker compose logs -f worker | grep -E "WARNING|ERROR"
 | `[worker] cpu=6% inflight=12 done=430 loop_lag=1ms` | Worker health |
 | `[ch-writer] Wrote 25 results (oldest 2.1s old)` | Results saved |
 | `[scheduler] ⛔ Auto-stop: ...` | Stopped itself, with the reason |
-| `[metrics-poller] Metrics unavailable ... 404` | Normal with Ollama (it has no `/metrics`) |
+| `[metrics-poller] Metrics unavailable ... 503` | Endpoint stopped or still starting; retried, warned once a minute |
+| `[metrics-poller] Server metrics off: ... HTTP 404` | The endpoint doesn't expose `/metrics`; the poller stops, client-side timings still work (set `VLLM_METRICS_URL` if it lives elsewhere) |
 
 **3 — GPU**
 ```
-watch -n 1 nvidia-smi          # on the GPU machine (local PC or E2E server)
-journalctl -u ollama -f        # local Ollama only
+./lt status                    # vLLM running / waiting requests and KV cache, from /metrics
 ```
+GPU utilisation and memory: the endpoint's monitoring page in TIR (there is no shell on the GPU node).
 
 **Grafana:** http://localhost:3000 (admin / `GRAFANA_ADMIN_PASSWORD`). The ClickHouse plugin is installed; add a data source (server `clickhouse`, port `8123`, user `default`) and chart the queries from [§11](#11-results-and-export). A ready-made dashboard is not built yet.
 
@@ -443,34 +444,36 @@ Load testing is about speed, but every response is also checked:
 
 ---
 
-## 13. Local model vs E2E
+## 13. E2E endpoint setup
 
-| | Local (development) | E2E (real test) |
-|---|---|---|
-| Purpose | Check the system and data work | Real performance numbers |
-| Model | Ollama `gemma4-16k` (16K context), RTX 4070 | ~70B **vision** model (e.g. Qwen2.5-VL-72B) on vLLM |
-| `.env` | `VLLM_URL=http://host.docker.internal:11434/v1`<br>`MODEL=gemma4-16k:latest`<br>`VIDEO_INPUT=frames`<br>`EXTRA_BODY='{"reasoning_effort": "none"}'`<br>`VLLM_METRICS_URL=` | `VLLM_URL=https://<e2e-host>/v1`<br>`VLLM_API_KEY=...`<br>`MODEL=<served model name>`<br>`VIDEO_INPUT=video`<br>`EXTRA_BODY=`<br>`VLLM_METRICS_URL=https://<e2e-host>/metrics` |
-| Load | small: `--rate-scale 0.1` | full profiles |
-| Server metrics | none (Ollama has no `/metrics`) | yes |
+The model is called like the [E2E TIR vLLM guide](https://docs.e2enetworks.com/docs/tir/Inference/Tutorials/vllm_openai/): the `openai` SDK with `base_url` = endpoint URL and `api_key` = TIR auth token (sent as `Authorization: Bearer`). The client uses `AsyncOpenAI` with SDK retries off, because the worker does its own retries and DLQ.
 
-**Local notes**
-- Ollama runs on the **host**, not in Docker; containers reach it via `host.docker.internal`.
-- Stock `gemma4` has a 4K context and silently cuts off long prompts. `gemma4-16k` is a variant with a 16K context (`ollama rm gemma4-16k` removes it). To recreate it:
-  `curl localhost:11434/api/create -d '{"model":"gemma4-16k","from":"gemma4:latest","parameters":{"num_ctx":16384}}'`
+| `.env` | Value |
+|---|---|
+| `VLLM_URL` | Endpoint URL from the TIR endpoint page, ending in `/v1`, e.g. `https://infer.e2enetworks.net/project/<p-id>/endpoint/<is-id>/v1` |
+| `VLLM_API_KEY` | TIR auth token |
+| `MODEL` | Served model name, exactly as `GET <VLLM_URL>/models` lists it (e.g. `Qwen/Qwen3.6-35B-A3B-FP8`) |
+| `EXTRA_BODY` | Optional, e.g. `{"chat_template_kwargs": {"enable_thinking": false}}` |
+| `VLLM_METRICS_URL` | Empty = `<VLLM_URL without /v1>/metrics` |
+
+All three of `VLLM_URL`, `VLLM_API_KEY` and `MODEL` are required; the worker refuses to start without them. Before a run:
+```
+docker compose run --rm -T dataset python -m src.services.vllm_client --check
+```
+| Result | Meaning |
+|---|---|
+| `✅ <model> is up at ...` | Ready |
+| `HTTP 503 ... no healthy upstream` | Endpoint stopped, scaled to 0 or still loading the model: check its status in TIR |
+| `401` / `403` | Wrong token, or no access to this endpoint |
+| `404` | `VLLM_URL` is not the endpoint URL ending in `/v1` |
+| `MODEL=... not served` | Use one of the names it lists |
 
 **E2E vLLM checklist**
 - A **vision** model (text-only 70B models such as Llama 3 70B can't see images).
-- `--max-model-len 16384` or more (ai_info prompts are ~13K tokens).
+- `--max-model-len 20480` or more (ai_info ≈ 14.4K prompt + 4,096 output tokens).
 - `--max-num-seqs` sized for the GPUs; keep `WORKER_CONCURRENCY` ≥ 1.5 × `--max-num-seqs`.
 - `/metrics` reachable from the test machine.
-- For honest numbers with repeated test data, run the main tests with **`--no-enable-prefix-caching`** (or check `prefix_cache_hit_rate`).
-
-**Without a GPU (mock server)** — to test the load tester itself:
-```
-docker compose --profile mock up -d mock-vllm
-# .env: VLLM_URL=http://mock-vllm:8000/v1, VLLM_METRICS_URL=http://mock-vllm:8000/metrics
-```
-The mock simulates batching limits, prefill/decode speed, errors, 429s, hangs and invalid JSON (`MOCK_*` settings).
+- Prefix caching can stay on at the endpoint: `ISOLATE_PREFIX_CACHE=true` sends a unique `cache_salt` per job (vLLM ≥ 0.9), so repeated test images don't hit the cache. `prefix_cache_hit_rate` in `./lt status` should stay near 0 during a run.
 
 ---
 
@@ -480,7 +483,7 @@ All in `.env` (see `.env.example`). Main ones:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `VLLM_URL`, `VLLM_API_KEY`, `MODEL` | | Model server and model name |
+| `VLLM_URL`, `VLLM_API_KEY`, `MODEL` | | E2E TIR endpoint URL (ending in `/v1`), auth token, served model name; all required |
 | `VLLM_METRICS_URL` | | vLLM `/metrics` (empty = derived from `VLLM_URL`) |
 | `DATASET_DIR` | | Your test data folder (read-only) |
 | `MACHINE_ID`, `MACHINES` | `A`, `A` | This machine (each clone runs independently) |
@@ -493,10 +496,11 @@ All in `.env` (see `.env.example`). Main ones:
 | `MAX_RPS`, `RATE_BURST` | `0` | Optional rate cap |
 | `MAX_PIXELS` | `1003520` | Image resolution sent to the model |
 | `IMAGE_VARIANTS_PX`, `VIDEO_VARIANTS_SIDE` | `1003520`, `1280` | Sizes prepared in the cache (comma list to prepare more; `MAX_PIXELS` / `VIDEO_SIDE` must be one of them) |
-| `VIDEO_INPUT`, `VIDEO_FRAMES`, `VIDEO_SIDE` | `video`, `4`, `1280` | How video is sent |
+| `VIDEO_SIDE` | `1280` | Video variant sent to the model |
 | `VIDEO_MAX_SECONDS`, `VIDEO_FPS`, `JPEG_QUALITY` | `10`, `0`, `90` | Media preparation |
 | `GUIDED_JSON` | `false` | Force JSON schema output (vLLM) |
 | `EXTRA_BODY` | | Extra JSON in every request |
+| `ISOLATE_PREFIX_CACHE` | `true` | Unique vLLM `cache_salt` per job, so repeated test images don't hit the prefix cache |
 | `AUTO_STOP`, `SLA_P95_MS`, `MAX_ERROR_RATE`, `QUEUE_GROWTH_WINDOW_S` | `true`, `0`, `0.02`, `120` | Auto-stop |
 | `GRAFANA_ADMIN_PASSWORD` | `admin` | Grafana login |
 
@@ -532,14 +536,13 @@ src/
     job_builder.py           case → job (media + JSON)
     task_event.py, task_ai_info.py, task_extraction.py, task_base.py, tasks.py
                              prompt building, parsing, production formatting, validation
-    vllm_client.py           streaming OpenAI-compatible client (+ single-request try-out CLI)
+    vllm_client.py           streaming client for the E2E endpoint (openai SDK; --check pre-flight, single-request try-out)
     job_queue.py             Redis Streams queue, retries, DLQ, idempotency, control
     scheduler.py             open-loop scheduler, drain, auto-stop
     worker.py                concurrent request execution
     ch_writer.py             batched, deduplicated writes of valid responses
     run_stats.py             live per-request stats in Redis (status, auto-stop, summary)
     metrics_poller.py        vLLM Prometheus metrics → Redis
-    mock_vllm.py             fake GPU server
     prompt_snapshot.py       dev tool: re-render prompts from a roboi-main checkout
     cli.py                   ./lt commands
 data/                        (not in git) manifest, cache, exports, logs, ground_truth.csv, events/
@@ -551,13 +554,13 @@ data/                        (not in git) manifest, cache, exports, logs, ground
 
 | Problem | Fix |
 |---|---|
-| `run.sh`: model not reachable | Start Ollama / check the E2E URL and key; `curl <VLLM_URL>/models` |
+| `run.sh` stops at step 3 | Read the message (see §13): 503 = endpoint not running, 401 = token, 404 = URL. Re-check with `docker compose run --rm -T dataset python -m src.services.vllm_client --check` |
 | `MODEL=... not served` | Use one of the names `run.sh` prints |
-| `schema_ok_pct` low, outputs cut off | Context too small: use `gemma4-16k` locally or raise `--max-model-len` on vLLM |
-| Many `expired` / `timeout` locally | The GPU is overloaded: use `--rate-scale 0.1`, raise `JOB_DEADLINE_S` / `REQUEST_TIMEOUT_S` |
+| `schema_ok_pct` low, outputs cut off | Context too small: raise `--max-model-len` on the endpoint (≥ 20480) |
+| Many `expired` / `timeout` | The endpoint is overloaded: use `--rate-scale 0.1`, raise `JOB_DEADLINE_S` / `REQUEST_TIMEOUT_S` |
 | `run ... is still active` | `./lt stop`, or `./lt run ... --force` |
 | `no manifest` / `not in cache` | Run manifest and preencode (or `./run.sh`) |
 | Event cases use `synthetic` JSON | Add `payload.json` event folders (§3) |
-| `metrics-poller` 404 | Normal with Ollama |
+| `metrics-poller`: `Server metrics off` | The endpoint has no `/metrics` (see §10); set `VLLM_METRICS_URL` if it lives elsewhere |
 | Service unhealthy | `docker compose ps`, `docker compose logs <service>` |
 | Changed code or `.env` not applied | `docker compose build`, then `docker compose up -d --force-recreate` (one image serves every service; `run.sh` never builds) |

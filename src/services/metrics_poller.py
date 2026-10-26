@@ -11,6 +11,13 @@ from src.services.base import BaseService
 
 LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([-+0-9.eE]+|NaN|[+-]Inf)')
 WARN_EVERY_S = 60
+# Answers that polling again will not fix; anything else (503 while the endpoint starts, timeouts) is retried
+PERMANENT = {401: "VLLM_API_KEY was rejected", 403: "the token has no access to /metrics",
+             404: "the endpoint does not expose /metrics"}
+
+
+class MetricsUnavailable(Exception):
+    """The server has no usable /metrics; stop polling"""
 
 
 def parse_prometheus(text: str) -> Dict[str, float]:
@@ -50,6 +57,13 @@ class MetricsPoller(BaseService):
             started = time.monotonic()
             try:
                 await self.poll()
+            except MetricsUnavailable as e:
+                self.log.warning(f"Server metrics off: {e}. Client-side metrics (TTFT, latency, tokens/s) and "
+                                 f"auto-stop on the Redis queue still work; set VLLM_METRICS_URL and restart "
+                                 f"metrics-poller if /metrics lives elsewhere")
+                while not self.stopping:  # stay up so the heartbeat keeps the container healthy
+                    await self.wait_or_stop(60)
+                return
             except Exception as e:
                 if time.monotonic() - self.last_warning > WARN_EVERY_S:
                     self.last_warning = time.monotonic()
@@ -57,12 +71,15 @@ class MetricsPoller(BaseService):
             await self.wait_or_stop(max(0.0, self.settings.metrics_poll_interval_s - (time.monotonic() - started)))
 
     async def poll(self) -> None:
-        response = await self.http.get(self.settings.metrics_url)
+        url = self.settings.metrics_url
+        response = await self.http.get(url)
+        if response.status_code in PERMANENT:
+            raise MetricsUnavailable(f"{url} answered HTTP {response.status_code} ({PERMANENT[response.status_code]})")
         response.raise_for_status()
         now = time.monotonic()
         m = parse_prometheus(response.text)
         if "vllm:num_requests_running" not in m:
-            raise ValueError("no vllm:* metrics in the response (not a vLLM server?)")
+            raise MetricsUnavailable(f"{url} has no vllm:* metrics (not a vLLM server?)")
 
         rates = {"prompt": None, "generation": None, "hit_rate": first(m, "vllm:gpu_prefix_cache_hit_rate")}
         if self.prev is not None and now > self.prev_t:

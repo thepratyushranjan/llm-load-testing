@@ -1,11 +1,10 @@
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from src.core.config import Settings, get_settings
 from src.models.dataset import CacheEntry, ManifestRow
 from src.models.job import Job, MediaRef, now_ms
 from src.services.event_meta import EVENT_FUNCTIONS, EventMetaLoader
-from src.services.preencode import frame_paths, image_variant, load_cache_index, video_variant
+from src.services.preencode import image_variant, load_cache_index, video_variant
 
 
 class JobBuilder:
@@ -23,16 +22,8 @@ class JobBuilder:
         refs: List[MediaRef] = []
         if row.video_sha1 and function in EVENT_FUNCTIONS:
             entry = self._entry(row.video_sha1, self.video_variant)
-            if self.settings.video_input == "frames":
-                data_dir = Path(self.settings.data_dir)
-                for path in frame_paths(data_dir, self.video_variant, entry.sha1, self.settings.video_frames):
-                    if not path.exists():
-                        raise FileNotFoundError(f"{path} missing: run preencode with VIDEO_INPUT=frames")
-                    refs.append(MediaRef(kind="image", sha1=entry.sha1, path=str(path.relative_to(data_dir)),
-                                         bytes=path.stat().st_size))
-            else:
-                refs.append(MediaRef(kind="video", sha1=entry.sha1, path=entry.path, bytes=entry.bytes,
-                                     duration_s=entry.duration_s))
+            refs.append(MediaRef(kind="video", sha1=entry.sha1, path=entry.path, bytes=entry.bytes,
+                                 duration_s=entry.duration_s))
         for _, sha1 in row.images:
             entry = self._entry(sha1, self.image_variant)
             refs.append(MediaRef(kind="image", sha1=entry.sha1, path=entry.path, bytes=entry.bytes))

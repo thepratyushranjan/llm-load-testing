@@ -77,7 +77,6 @@ class Result(BaseModel):
     n_videos: int = 0
     media_bytes: int = 0
     video_duration_s: Optional[float] = None
-    num_frames: Optional[int] = None  # VIDEO_INPUT=frames
 
     created_ts: int
     enqueued_ts: Optional[int] = None

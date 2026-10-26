@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import inspect
 import json
 import sys
 import time
@@ -8,11 +9,19 @@ from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional
 
 import httpx
+from openai import (APIConnectionError, APIError, APIStatusError, APITimeoutError, AsyncOpenAI, AsyncStream,
+                    AuthenticationError, DefaultAsyncHttpxClient, NotFoundError, PermissionDeniedError,
+                    RateLimitError)
+from openai.resources.chat.completions import AsyncCompletions
+from openai.types.chat import ChatCompletionChunk
 
 from src.core.config import Settings, get_settings
 from src.models.job import Status, now_ms
 
 DEFAULT_RETRY_AFTER_S = 1.0
+CHECK_TIMEOUT_S = 15.0
+# Body fields the SDK takes as arguments; the rest (vLLM-only, e.g. cache_salt) go through extra_body
+SDK_PARAMS = set(inspect.signature(AsyncCompletions.create).parameters) - {"self", "extra_body"}
 
 
 @dataclass
@@ -57,36 +66,32 @@ def parse_retry_after(value: Optional[str]) -> float:
 
 
 class VllmClient:
-    """Async OpenAI-compatible client (vLLM on E2E, Ollama locally) that streams and times every request"""
+    """Async client for the E2E TIR vLLM endpoint (OpenAI SDK) that streams and times every request"""
 
     def __init__(self, settings: Optional[Settings] = None):
         self.settings = settings or get_settings()
-        headers = {"Content-Type": "application/json"}
-        if self.settings.vllm_api_key:
-            headers["Authorization"] = f"Bearer {self.settings.vllm_api_key}"
+        self.settings.require_vllm()
         timeout = self.settings.request_timeout_s
-        self.http = httpx.AsyncClient(
+        self.client = AsyncOpenAI(
             base_url=self.settings.vllm_url.rstrip("/"),
-            headers=headers,
+            api_key=self.settings.vllm_api_key,
             timeout=httpx.Timeout(timeout, connect=10.0),
-            limits=httpx.Limits(
+            max_retries=0,  # the worker retries (429 / 5xx / timeout) and sends failures to the DLQ
+            http_client=DefaultAsyncHttpxClient(limits=httpx.Limits(
                 max_connections=self.settings.worker_concurrency,
                 max_keepalive_connections=self.settings.worker_concurrency,
-            ),
+            )),
         )
         self.extra_body: Dict = json.loads(self.settings.extra_body) if self.settings.extra_body else {}
 
     async def close(self) -> None:
-        await self.http.aclose()
+        await self.client.close()
 
     async def models(self) -> List[str]:
-        response = await self.http.get("/models")
-        response.raise_for_status()
-        return [m["id"] for m in response.json().get("data", [])]
+        return [m.id async for m in self.client.models.list()]
 
     async def chat(self, body: Dict, deadline_ts: Optional[int] = None) -> CallResult:
         """Stream one chat completion. Never raises; the outcome is in CallResult.status"""
-        body = {**body, **self.extra_body, "stream": True, "stream_options": {"include_usage": True}}
         timeout_s = self.settings.request_timeout_s
         if deadline_ts is not None:
             timeout_s = min(timeout_s, (deadline_ts - now_ms()) / 1000)
@@ -95,71 +100,105 @@ class VllmClient:
             result.status, result.error_type = Status.EXPIRED, "deadline_passed"
             return result
 
+        params = {k: v for k, v in body.items() if k in SDK_PARAMS}
+        extra = {**{k: v for k, v in body.items() if k not in SDK_PARAMS}, **self.extra_body}
         try:
             async with asyncio.timeout(timeout_s):
-                async with self.http.stream("POST", "/chat/completions", json=body) as response:
-                    result.http_status = response.status_code
-                    if response.status_code != 200:
-                        await self._http_error(response, result)
-                        return result
-                    await self._read_stream(response, result)
-        except (TimeoutError, httpx.TimeoutException):
+                stream = await self.client.chat.completions.create(
+                    **params, stream=True, stream_options={"include_usage": True}, extra_body=extra or None,
+                )
+                async with stream:
+                    result.http_status = stream.response.status_code
+                    await self._read_stream(stream, result)
+        except RateLimitError as e:
+            result.status, result.error_type, result.http_status = Status.RATE_LIMITED, "http_429", e.status_code
+            result.retry_after_s = parse_retry_after(e.response.headers.get("retry-after"))
+            result.error_message = str(e)[:500]
+        except APIStatusError as e:
+            result.status, result.error_type, result.http_status = Status.ERROR, f"http_{e.status_code}", e.status_code
+            result.error_message = str(e)[:500]
+        except (TimeoutError, APITimeoutError, httpx.TimeoutException):
             result.status, result.error_type = Status.TIMEOUT, "timeout"
             result.error_message = f"no complete response within {timeout_s:.1f}s"
-        except httpx.HTTPError as e:
+        except APIConnectionError as e:
+            cause = e.__cause__ or e
+            result.status, result.error_type = Status.ERROR, type(cause).__name__
+            result.error_message = str(cause)[:500]
+        except APIError as e:  # error event inside the stream
+            result.status, result.error_type = Status.ERROR, "stream_error"
+            result.error_message = json.dumps(e.body)[:500] if e.body else str(e)[:500]
+        except httpx.HTTPError as e:  # connection dropped while reading the stream
             result.status, result.error_type = Status.ERROR, type(e).__name__
             result.error_message = str(e)[:500]
         result.done_ts = result.done_ts or now_ms()
         return result
 
-    async def _http_error(self, response: httpx.Response, result: CallResult) -> None:
-        text = (await response.aread()).decode(errors="replace")
-        result.done_ts = now_ms()
-        result.error_message = text[:500]
-        if response.status_code == 429:
-            result.status, result.error_type = Status.RATE_LIMITED, "http_429"
-            result.retry_after_s = parse_retry_after(response.headers.get("retry-after"))
-        else:
-            result.status, result.error_type = Status.ERROR, f"http_{response.status_code}"
-
-    async def _read_stream(self, response: httpx.Response, result: CallResult) -> None:
+    async def _read_stream(self, stream: AsyncStream[ChatCompletionChunk], result: CallResult) -> None:
         text: List[str] = []
         reasoning: List[str] = []
-        async for line in response.aiter_lines():
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            chunk = json.loads(data)
-            if "error" in chunk:
-                result.status, result.error_type = Status.ERROR, "stream_error"
-                result.error_message = json.dumps(chunk["error"])[:500]
-                result.done_ts = now_ms()
-                return
-            for choice in chunk.get("choices", []):
-                delta = choice.get("delta") or {}
-                content = delta.get("content")
-                # vLLM reasoning parsers: reasoning_content; Ollama: reasoning
-                thought = delta.get("reasoning_content") or delta.get("reasoning")
+        async for chunk in stream:
+            for choice in chunk.choices:
+                delta = choice.delta
+                content = delta.content if delta else None
+                # vLLM reasoning parsers: reasoning_content (older releases) / reasoning (newer)
+                thought = (getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)) if delta else None
                 if (content or thought) and result.first_token_ts is None:
                     result.first_token_ts = now_ms()
                 if content:
                     text.append(content)
                 if thought:
                     reasoning.append(thought)
-                if choice.get("finish_reason"):
-                    result.finish_reason = choice["finish_reason"]
-            usage = chunk.get("usage")
-            if usage:
-                result.prompt_tokens = usage.get("prompt_tokens")
-                result.completion_tokens = usage.get("completion_tokens")
-                result.cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+                if choice.finish_reason:
+                    result.finish_reason = choice.finish_reason
+            if chunk.usage:
+                result.prompt_tokens = chunk.usage.prompt_tokens
+                result.completion_tokens = chunk.usage.completion_tokens
+                details = chunk.usage.prompt_tokens_details
+                result.cached_tokens = details.cached_tokens if details else None
         result.done_ts = now_ms()
         result.text, result.reasoning_text = "".join(text), "".join(reasoning)
         result.status = Status.OK
         if result.finish_reason == "length":
             result.error_type = "max_tokens_reached"
+
+
+async def _check() -> int:
+    """Pre-flight (run.sh): the E2E endpoint answers, the auth token is accepted and MODEL is served"""
+    settings = get_settings()
+    url = settings.vllm_url
+    try:
+        client = VllmClient(settings)
+    except ValueError as e:
+        print(f"❌ {e}")
+        return 1
+    try:
+        async with asyncio.timeout(CHECK_TIMEOUT_S):
+            ids = await client.models()
+    except AuthenticationError:
+        print(f"❌ {url} rejected VLLM_API_KEY (401): copy the auth token from the TIR endpoint page")
+        return 1
+    except PermissionDeniedError:
+        print(f"❌ {url} refused VLLM_API_KEY (403): the token has no access to this endpoint")
+        return 1
+    except NotFoundError:
+        print(f"❌ {url.rstrip('/')}/models not found (404): VLLM_URL should be the TIR endpoint URL ending in /v1")
+        return 1
+    except APIStatusError as e:
+        print(f"❌ {url} answered HTTP {e.status_code} (endpoint stopped or still starting?): {e.message[:300]}")
+        return 1
+    except (TimeoutError, APITimeoutError):
+        print(f"❌ {url} did not answer within {CHECK_TIMEOUT_S:.0f}s")
+        return 1
+    except APIConnectionError as e:
+        print(f"❌ model server not reachable at {url}: {e.__cause__ or e}")
+        return 1
+    finally:
+        await client.close()
+    if settings.model not in ids:
+        print(f"❌ MODEL={settings.model} not served at {url}; available: {ids}")
+        return 1
+    print(f"✅ {settings.model} is up at {url}")
+    return 0
 
 
 async def _try(args) -> int:
@@ -211,12 +250,15 @@ async def _try(args) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Send real requests for dataset cases to VLLM_URL and print timings")
+    parser = argparse.ArgumentParser(description="Send real requests for dataset cases to the E2E endpoint (VLLM_URL) and print timings")
     parser.add_argument("--function", default="event", choices=["event", "ai_info", "extraction"])
     parser.add_argument("--case", help="case_id from the manifest (default: first matching cases)")
     parser.add_argument("-n", type=int, default=1, help="number of cases to send, one after another")
     parser.add_argument("--show", action="store_true", help="print the formatted response")
-    return asyncio.run(_try(parser.parse_args()))
+    parser.add_argument("--check", action="store_true",
+                        help="only check that the endpoint answers, the token is accepted and MODEL is served")
+    args = parser.parse_args()
+    return asyncio.run(_check() if args.check else _try(args))
 
 
 if __name__ == "__main__":
